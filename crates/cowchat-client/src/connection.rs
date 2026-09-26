@@ -452,7 +452,7 @@ impl CowchatClient {
 
     /// WebSocket transport with either the transport key or a member session
     /// proof in the register frame.
-    pub(crate) async fn connect_ws_registered(
+    pub async fn connect_ws_registered(
         url: &str,
         key: &str,
         session: Option<SessionProof>,
@@ -637,6 +637,55 @@ impl CowchatClient {
         );
     }
 
+    /// Decrypt a hosted message using its exact cached epoch without exposing keys.
+    pub fn decrypt_hosted_message(
+        &self,
+        message: &mut cowchat_core::ChatMessage,
+    ) -> Result<(), ClientError> {
+        let epoch = message
+            .key_epoch
+            .as_deref()
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+            .ok_or_else(|| ClientError::Encryption("room input is not hosted-encrypted".into()))?;
+        let context = cowchat_core::room_crypto::Context {
+            room_id: &message.room_id,
+            key_epoch: epoch,
+            message_id: &message.message_id,
+        };
+        message.content = cowchat_core::room_crypto::decrypt(
+            self.hosted_key(&message.room_id, epoch)?,
+            &context,
+            &message.content,
+        )
+        .map_err(|_| ClientError::Encryption("room input did not decrypt".into()))?;
+        Ok(())
+    }
+
+    /// Prepare a reply under the newest cached epoch without exposing keys.
+    pub fn prepare_hosted_reply(
+        &self,
+        input: &cowchat_core::ChatMessage,
+        reply_id: &str,
+        text: &str,
+    ) -> Result<SendMessagePayload, ClientError> {
+        let epoch = self
+            .newest_hosted_epoch(&input.room_id)
+            .ok_or_else(|| ClientError::Encryption("room key is not open".into()))?;
+        let context = cowchat_core::room_crypto::Context {
+            room_id: &input.room_id,
+            key_epoch: epoch,
+            message_id: reply_id,
+        };
+        Self::prepare_room_key_message(
+            self.hosted_key(&input.room_id, epoch)?,
+            &context,
+            text,
+            Some(&input.message_id),
+            Vec::new(),
+            serde_json::json!({}),
+        )
+    }
+
     pub(crate) fn hosted_key(
         &self,
         room_id: &str,
@@ -693,7 +742,7 @@ impl CowchatClient {
     }
 
     /// Send a request and wait for the response.
-    pub(crate) async fn request(
+    pub async fn request(
         &self,
         frame_type: FrameType,
         payload: serde_json::Value,
@@ -704,7 +753,7 @@ impl CowchatClient {
 
     /// `request` for operations the server legitimately holds open longer,
     /// such as room-key activation (publication, finality and holder fence).
-    pub(crate) async fn request_within(
+    pub async fn request_within(
         &self,
         frame_type: FrameType,
         payload: serde_json::Value,
