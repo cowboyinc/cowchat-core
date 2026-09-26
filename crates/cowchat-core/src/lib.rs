@@ -1,3 +1,4 @@
+pub mod actor_directory;
 pub mod crypto;
 pub mod error;
 pub mod models;

@@ -242,6 +242,61 @@ pub struct SendMessagePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    /// Lowercase ASCII without the leading `@`.
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub signing_key: [u8; 32],
+    pub generation: u64,
+    /// Hex-encoded Ed25519 signature by the seat's record key.
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorWakeMode {
+    MentionsOnly,
+    AllMessages,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetActorWakeModePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub mode: ActorWakeMode,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveActorHandlePayload {
+    pub room_id: String,
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedActorHandle {
+    pub room_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub wake_mode: ActorWakeMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryPayload {
     pub room_id: String,
     #[serde(default = "default_limit")]

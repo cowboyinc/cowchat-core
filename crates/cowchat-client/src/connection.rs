@@ -1,4 +1,5 @@
 use cowchat_core::*;
+use ed25519_dalek::{Signer, SigningKey};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -1133,6 +1134,139 @@ impl CowchatClient {
             .request(FrameType::RoomInfo, serde_json::json!({"room_id": room_id}))
             .await?;
         Ok(resp.payload)
+    }
+
+    /// Submit a prepared, actor-signed claim. Retain the exact command ID and
+    /// signature when retrying an uncertain result.
+    pub async fn claim_actor_handle(
+        &self,
+        payload: &ClaimActorHandlePayload,
+    ) -> Result<ResolvedActorHandle, ClientError> {
+        let response = self
+            .request(FrameType::ClaimActorHandle, serde_json::to_value(payload)?)
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    pub fn prepare_actor_handle_claim(
+        room_id: &str,
+        handle: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        signing_key: &SigningKey,
+    ) -> ClaimActorHandlePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::claim_preimage(
+            room_id,
+            &command_id,
+            handle,
+            agent_id,
+            &seat_id,
+            generation,
+        );
+        ClaimActorHandlePayload {
+            room_id: room_id.into(),
+            command_id,
+            handle: handle.into(),
+            seat_id,
+            signing_key: signing_key.verifying_key().to_bytes(),
+            generation,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+        }
+    }
+
+    pub async fn release_actor_handle(
+        &self,
+        payload: &ReleaseActorHandlePayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::ReleaseActorHandle,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn prepare_actor_handle_release(
+        room_id: &str,
+        handle: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        signing_key: &SigningKey,
+    ) -> ReleaseActorHandlePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::release_preimage(
+            room_id,
+            &command_id,
+            handle,
+            agent_id,
+            &seat_id,
+            generation,
+        );
+        ReleaseActorHandlePayload {
+            room_id: room_id.into(),
+            command_id,
+            handle: handle.into(),
+            seat_id,
+            generation,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+        }
+    }
+
+    pub async fn set_actor_wake_mode(
+        &self,
+        payload: &SetActorWakeModePayload,
+    ) -> Result<ActorWakeMode, ClientError> {
+        let response = self
+            .request(FrameType::SetActorWakeMode, serde_json::to_value(payload)?)
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    pub fn prepare_actor_wake_mode(
+        room_id: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        mode: ActorWakeMode,
+        signing_key: &SigningKey,
+    ) -> SetActorWakeModePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::wake_mode_preimage(
+            room_id,
+            &command_id,
+            agent_id,
+            &seat_id,
+            generation,
+            mode,
+        );
+        SetActorWakeModePayload {
+            room_id: room_id.into(),
+            command_id,
+            seat_id,
+            generation,
+            mode,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+        }
+    }
+
+    pub async fn resolve_actor_handle(
+        &self,
+        room_id: &str,
+        handle: &str,
+    ) -> Result<ResolvedActorHandle, ClientError> {
+        let response = self
+            .request(
+                FrameType::ResolveActorHandle,
+                serde_json::to_value(ResolveActorHandlePayload {
+                    room_id: room_id.into(),
+                    handle: handle.into(),
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
     }
 
     /// Convenience: return the agent_id currently holding the turn token in `room_id`,
