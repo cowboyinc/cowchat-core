@@ -1136,6 +1136,20 @@ impl CowchatClient {
         Ok(resp.payload)
     }
 
+    /// Enroll one finalized native actor seat under a hosted room. Retain the
+    /// command ID and proof bytes when retrying an uncertain result.
+    pub async fn enroll_native_actor_seat(
+        &self,
+        payload: &EnrollNativeActorSeatPayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::EnrollNativeActorSeat,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Submit a prepared, actor-signed claim. Retain the exact command ID and
     /// signature when retrying an uncertain result.
     pub async fn claim_actor_handle(
