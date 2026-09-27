@@ -915,6 +915,27 @@ impl CowchatClient {
         )
     }
 
+    /// Prepare a focused send using the verified hosted key already opened by
+    /// this member session. The caller must save the returned bytes before
+    /// submission so an uncertain response can be retried exactly.
+    pub fn prepare_cached_hosted_native_focused_message(
+        &self,
+        context: &cowchat_core::room_crypto::Context<'_>,
+        content: &str,
+        target_handle: &str,
+        native: NativeFocusedMaterial<'_>,
+        reply_to: Option<&str>,
+    ) -> Result<SendMessagePayload, ClientError> {
+        prepare_hosted_native_focused_message(
+            self.hosted_key(context.room_id, context.key_epoch)?,
+            context,
+            content,
+            target_handle,
+            native,
+            reply_to,
+        )
+    }
+
     pub(crate) fn hosted_key(
         &self,
         room_id: &str,
