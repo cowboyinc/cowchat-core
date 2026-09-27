@@ -82,6 +82,7 @@ pub fn recovery_preimage(
 pub fn wake_mode_preimage(
     room_id: &str,
     command_id: &str,
+    handle: &str,
     agent_id: &str,
     seat_id: &[u8; 32],
     generation: u64,
@@ -91,7 +92,7 @@ pub fn wake_mode_preimage(
         b"wake-mode",
         room_id,
         command_id,
-        "",
+        handle,
         agent_id,
         seat_id,
         generation,
@@ -130,6 +131,7 @@ mod tests {
             wake_mode_preimage(
                 "room-a",
                 "one",
+                "financial_planner",
                 "actor-a",
                 &[1; 32],
                 1,
@@ -138,10 +140,31 @@ mod tests {
             wake_mode_preimage(
                 "room-a",
                 "one",
+                "financial_planner",
                 "actor-a",
                 &[1; 32],
                 1,
                 ActorWakeMode::AllMessages
+            )
+        );
+        assert_ne!(
+            wake_mode_preimage(
+                "room-a",
+                "one",
+                "financial_planner",
+                "actor-a",
+                &[1; 32],
+                1,
+                ActorWakeMode::AllMessages,
+            ),
+            wake_mode_preimage(
+                "room-a",
+                "one",
+                "weather_bot",
+                "actor-a",
+                &[1; 32],
+                1,
+                ActorWakeMode::AllMessages,
             )
         );
     }

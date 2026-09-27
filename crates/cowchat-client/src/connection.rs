@@ -1811,6 +1811,7 @@ impl CowchatClient {
 
     pub fn prepare_actor_wake_mode(
         room_id: &str,
+        handle: &str,
         agent_id: &str,
         seat_id: [u8; 32],
         generation: u64,
@@ -1821,6 +1822,7 @@ impl CowchatClient {
         let preimage = cowchat_core::actor_directory::wake_mode_preimage(
             room_id,
             &command_id,
+            handle,
             agent_id,
             &seat_id,
             generation,
@@ -1829,6 +1831,7 @@ impl CowchatClient {
         SetActorWakeModePayload {
             room_id: room_id.into(),
             command_id,
+            handle: handle.into(),
             seat_id,
             generation,
             mode,

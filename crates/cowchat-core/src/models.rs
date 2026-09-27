@@ -379,6 +379,7 @@ pub enum ActorWakeMode {
 pub struct SetActorWakeModePayload {
     pub room_id: String,
     pub command_id: String,
+    pub handle: String,
     pub seat_id: [u8; 32],
     pub generation: u64,
     pub mode: ActorWakeMode,
