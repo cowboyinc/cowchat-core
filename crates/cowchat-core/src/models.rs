@@ -243,6 +243,9 @@ pub struct SendMessagePayload {
     /// hosted server validates and durably stores these before routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_focused: Option<NativeFocusedSend>,
+    /// Sender-prepared untargeted native bytes for a room-wide message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_room_wide: Option<NativeRoomWideSend>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +255,14 @@ pub struct NativeFocusedSend {
     /// Exact sealed Messages record, lowercase hex for the JSON transport.
     pub sealed_record_hex: String,
     /// Exact sender-signed pre-append intent, lowercase hex.
+    pub signed_intent_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeRoomWideSend {
+    /// Exact sealed Messages record, lowercase hex for the JSON transport.
+    pub sealed_record_hex: String,
+    /// Exact sender-signed untargeted pre-append intent, lowercase hex.
     pub signed_intent_hex: String,
 }
 

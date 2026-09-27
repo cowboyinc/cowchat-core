@@ -71,6 +71,13 @@ pub struct NativeFocusedMaterial<'a> {
     pub claim_generation: u64,
 }
 
+pub struct NativeRoomWideMaterial<'a> {
+    pub header: &'a cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
+    pub generation_secret: &'a [u8; 32],
+    pub signing_seed: &'a [u8; 32],
+    pub expected_record_signing_key: &'a [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendDeliveryStatus {
@@ -165,6 +172,44 @@ pub fn prepare_hosted_native_focused_message(
     )?;
     payload.native_focused = Some(NativeFocusedSend {
         target_handle: target_handle.into(),
+        sealed_record_hex: hex::encode(prepared.sealed_record),
+        signed_intent_hex: hex::encode(prepared.signed_intent),
+    });
+    Ok(payload)
+}
+
+/// Prepare both encrypted room views for a room-wide human message. The
+/// returned bytes are one retry unit and must be persisted before submission.
+pub fn prepare_hosted_native_room_wide_message(
+    hosted_key: &[u8; 32],
+    context: &cowchat_core::room_crypto::Context<'_>,
+    content: &str,
+    native: NativeRoomWideMaterial<'_>,
+    reply_to: Option<&str>,
+) -> Result<SendMessagePayload, ClientError> {
+    if context.message_id != hex::encode(native.header.message_id)
+        || reply_to != native.header.reply_to.map(hex::encode).as_deref()
+    {
+        return Err(ClientError::Encryption(
+            "hosted and native room-wide identities or reply targets do not match".into(),
+        ));
+    }
+    let prepared = prepare_native_room_wide_message(
+        native.header,
+        native.generation_secret,
+        content.as_bytes(),
+        native.signing_seed,
+        native.expected_record_signing_key,
+    )?;
+    let mut payload = CowchatClient::prepare_room_key_message(
+        hosted_key,
+        context,
+        content,
+        reply_to,
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    payload.native_room_wide = Some(NativeRoomWideSend {
         sealed_record_hex: hex::encode(prepared.sealed_record),
         signed_intent_hex: hex::encode(prepared.signed_intent),
     });
@@ -291,6 +336,65 @@ mod tests {
             },
             &key.verifying_key().to_bytes(),
             &secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"ordinary room message");
+    }
+
+    #[test]
+    fn hosted_room_wide_prepare_retains_both_encrypted_views() {
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let header = HumanRoomWideHeaderV1 {
+            chain_id: 7,
+            room_id: [0x72; 32],
+            seat_id: [0x73; 32],
+            key_binding_commitment: [0x74; 32],
+            key_generation: 2,
+            message_id: [0x75; 32],
+            reply_to: None,
+        };
+        let message_id = hex::encode(header.message_id);
+        let context = cowchat_core::room_crypto::Context {
+            room_id: "hosted-room",
+            key_epoch: 2,
+            message_id: &message_id,
+        };
+        let hosted_key = [0x76; 32];
+        let native_secret = [0x77; 32];
+        let payload = prepare_hosted_native_room_wide_message(
+            &hosted_key,
+            &context,
+            "ordinary room message",
+            NativeRoomWideMaterial {
+                header: &header,
+                generation_secret: &native_secret,
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(payload.native_focused.is_none());
+        assert_eq!(
+            cowchat_core::room_crypto::decrypt(&hosted_key, &context, &payload.content).unwrap(),
+            "ordinary room message"
+        );
+        let persisted = serde_json::to_vec(&payload).unwrap();
+        let retry: SendMessagePayload = serde_json::from_slice(&persisted).unwrap();
+        let native = retry.native_room_wide.unwrap();
+        let sealed = hex::decode(native.sealed_record_hex).unwrap();
+        let opened = open_room_wide_source_seat_record_v1(
+            &sealed,
+            &ExpectedRoomWideSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"ordinary room message");
@@ -1359,6 +1463,7 @@ impl CowchatClient {
             metadata,
             mentions,
             native_focused: None,
+            native_room_wide: None,
         }
     }
 
@@ -1384,6 +1489,7 @@ impl CowchatClient {
             mentions,
             metadata,
             native_focused: None,
+            native_room_wide: None,
         })
     }
 
@@ -2159,6 +2265,7 @@ impl CowchatClient {
             metadata: serde_json::json!({}),
             mentions,
             native_focused: None,
+            native_room_wide: None,
         })
     }
 
