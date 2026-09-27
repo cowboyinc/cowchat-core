@@ -81,6 +81,169 @@ pub struct ActorReplyHeaderV1 {
     pub reply_to: [u8; 32],
 }
 
+/// The source-seat fields of a focused human message. The caller must obtain
+/// these values from finalized authority and retain the sealed result for
+/// retry; this constructor does not establish room membership on its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanFocusedHeaderV1 {
+    pub chain_id: u64,
+    pub room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub key_binding_commitment: [u8; 32],
+    pub key_generation: u64,
+    pub message_id: [u8; 32],
+    pub target_seat_id: [u8; 32],
+    pub reply_to: Option<[u8; 32]>,
+}
+
+pub fn human_focused_header_v1(message: &HumanFocusedHeaderV1) -> Result<Vec<u8>> {
+    if message.chain_id == 0 || message.key_generation == 0 {
+        return Err(Error::Schema);
+    }
+    for value in [
+        &message.room_id,
+        &message.seat_id,
+        &message.key_binding_commitment,
+        &message.message_id,
+        &message.target_seat_id,
+    ] {
+        nonzero_32(value)?;
+    }
+    if message.seat_id == message.target_seat_id {
+        return Err(Error::Scope);
+    }
+    let reply_to = message
+        .reply_to
+        .map(|id| Value::Text(hex32(&id)))
+        .unwrap_or(Value::Null);
+    canonical::encode(Value::Map(vec![
+        (Value::Text("v".into()), Value::Integer(3.into())),
+        (
+            Value::Text("message_id".into()),
+            Value::Text(hex32(&message.message_id)),
+        ),
+        (
+            Value::Text("chain_id".into()),
+            Value::Integer(message.chain_id.into()),
+        ),
+        (
+            Value::Text("room".into()),
+            Value::Text(hex32(&message.room_id)),
+        ),
+        (
+            Value::Text("seat".into()),
+            Value::Text(hex32(&message.seat_id)),
+        ),
+        (Value::Text("role".into()), Value::Text("human".into())),
+        (Value::Text("via".into()), Value::Null),
+        (Value::Text("via_sender".into()), Value::Null),
+        (Value::Text("class".into()), Value::Text("message".into())),
+        (Value::Text("reply_to".into()), reply_to),
+        (
+            Value::Text("mentions".into()),
+            Value::Array(vec![Value::Text(hex32(&message.target_seat_id))]),
+        ),
+        (
+            Value::Text("wake_hint".into()),
+            Value::Text("normal".into()),
+        ),
+        (
+            Value::Text("gen".into()),
+            Value::Integer(message.key_generation.into()),
+        ),
+        (
+            Value::Text("cert".into()),
+            Value::Text(hex32(&message.key_binding_commitment)),
+        ),
+        (
+            Value::Text("nonce".into()),
+            Value::Text("AAAAAAAAAAAAAAAA".into()),
+        ),
+    ]))
+}
+
+pub fn seal_human_focused_message_v1(
+    message: &HumanFocusedHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    if SigningKey::from_bytes(signing_seed)
+        .verifying_key()
+        .to_bytes()
+        != *expected_record_signing_key
+    {
+        return Err(Error::Authority);
+    }
+    envelope::seal(
+        &human_focused_header_v1(message)?,
+        generation_secret,
+        plaintext,
+        signing_seed,
+    )
+}
+
+#[cfg(test)]
+mod focused_message_tests {
+    use super::*;
+
+    #[test]
+    fn focused_human_record_is_sealed_for_one_native_target() {
+        let signing_seed = [0x41; 32];
+        let record_key = SigningKey::from_bytes(&signing_seed)
+            .verifying_key()
+            .to_bytes();
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x42; 32],
+            seat_id: [0x43; 32],
+            key_binding_commitment: [0x44; 32],
+            key_generation: 3,
+            message_id: [0x45; 32],
+            target_seat_id: [0x46; 32],
+            reply_to: None,
+        };
+        let secret = [0x47; 32];
+        let sealed = seal_human_focused_message_v1(
+            &header,
+            &secret,
+            b"payroll forecast",
+            &signing_seed,
+            &record_key,
+        )
+        .unwrap();
+        assert_eq!(
+            authenticated_record_message_id_v1(&sealed, &record_key).unwrap(),
+            header.message_id
+        );
+        let expected = ExpectedSourceSeatRecordV1 {
+            chain_id: header.chain_id,
+            room_id: header.room_id,
+            source_seat_id: header.seat_id,
+            source_seat_kind: SourceSeatKindV1::Human,
+            source_key_binding_commitment: header.key_binding_commitment,
+            key_generation: header.key_generation,
+            target_seat_id: header.target_seat_id,
+        };
+        let opened = open_source_seat_record_v1(&sealed, &expected, &record_key, &secret).unwrap();
+        assert_eq!(opened.plaintext, b"payroll forecast");
+        assert_eq!(opened.mentions, vec![header.target_seat_id]);
+        let wrong = ExpectedSourceSeatRecordV1 {
+            target_seat_id: [0x48; 32],
+            ..expected
+        };
+        assert_eq!(
+            open_source_seat_record_v1(&sealed, &wrong, &record_key, &secret),
+            Err(Error::Scope)
+        );
+        assert_eq!(
+            seal_human_focused_message_v1(&header, &secret, b"x", &[0x49; 32], &record_key),
+            Err(Error::Authority)
+        );
+    }
+}
+
 struct SealedRecord {
     header: Vec<u8>,
     body: String,

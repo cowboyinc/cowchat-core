@@ -1,5 +1,6 @@
 use cowchat_core::*;
 use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +9,56 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct PreparedNativeFocusedMessage {
+    pub message_id: [u8; 32],
+    pub sealed_record: Vec<u8>,
+    pub signed_intent: Vec<u8>,
+}
+
+/// Prepare one native sealed record and one pre-append focused intent. Retain
+/// both exact byte strings for retry after an uncertain network result.
+pub fn prepare_native_focused_message(
+    header: &cowchat_crypto::native_actor::HumanFocusedHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+    claim_generation: u64,
+) -> Result<PreparedNativeFocusedMessage, ClientError> {
+    let sealed_record = cowchat_crypto::native_actor::seal_human_focused_message_v1(
+        header,
+        generation_secret,
+        plaintext,
+        signing_seed,
+        expected_record_signing_key,
+    )
+    .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut intent = cowchat_core::native_route::FocusedRoutingIntentV1 {
+        room_id: header.room_id,
+        source_seat_id: header.seat_id,
+        target_seat_id: header.target_seat_id,
+        message_id: header.message_id,
+        message_commitment: Sha256::digest(&sealed_record).into(),
+        claim_generation,
+        signature: [0; 64],
+    };
+    let preimage = intent
+        .signing_preimage()
+        .ok_or_else(|| ClientError::Encryption("invalid native route".into()))?;
+    intent.signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    let signed_intent = intent
+        .wire_bytes()
+        .ok_or_else(|| ClientError::Encryption("invalid native route".into()))?;
+    Ok(PreparedNativeFocusedMessage {
+        message_id: header.message_id,
+        sealed_record,
+        signed_intent,
+    })
+}
 
 async fn read_frame_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -34,9 +85,58 @@ async fn read_frame_line<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowchat_crypto::native_actor::{
+        open_source_seat_record_v1, ExpectedSourceSeatRecordV1, HumanFocusedHeaderV1,
+        SourceSeatKindV1,
+    };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn focused_native_prepare_binds_exact_sealed_record_and_target() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x32; 32],
+            seat_id: [0x33; 32],
+            key_binding_commitment: [0x34; 32],
+            key_generation: 2,
+            message_id: [0x35; 32],
+            target_seat_id: [0x36; 32],
+            reply_to: None,
+        };
+        let secret = [0x37; 32];
+        let prepared = prepare_native_focused_message(
+            &header,
+            &secret,
+            b"forecast",
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+            1,
+        )
+        .unwrap();
+        let opened = open_source_seat_record_v1(
+            &prepared.sealed_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"forecast");
+        assert_eq!(prepared.signed_intent.len(), 234);
+        let commitment = Sha256::digest(&prepared.sealed_record);
+        assert_eq!(&prepared.signed_intent[129..161], commitment.as_slice());
+        assert_eq!(&prepared.signed_intent[65..97], &header.target_seat_id);
+    }
 
     #[tokio::test]
     async fn client_answers_server_heartbeat_ping() {

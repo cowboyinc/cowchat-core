@@ -1,3 +1,6 @@
 mod connection;
 
-pub use connection::{ActorReply, ClientError, CowchatClient, Event};
+pub use connection::{
+    prepare_native_focused_message, ActorReply, ClientError, CowchatClient, Event,
+    PreparedNativeFocusedMessage,
+};
