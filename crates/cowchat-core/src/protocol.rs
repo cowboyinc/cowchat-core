@@ -99,6 +99,7 @@ pub enum FrameType {
     SendMessage,
     EnrollNativeActorSeat,
     EnrollNativeSourceSeat,
+    ProvisionNativeAppendGrant,
     ClaimActorHandle,
     ReleaseActorHandle,
     SetActorWakeMode,

@@ -256,6 +256,15 @@ pub struct NativeFocusedSend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionNativeAppendGrantPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub lane_id: u64,
+    /// Owner-issued canonical `StreamGrantV2` bytes, lowercase hex.
+    pub grant_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimActorHandlePayload {
     pub room_id: String,
     pub command_id: String,

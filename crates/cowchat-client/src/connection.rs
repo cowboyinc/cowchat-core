@@ -1519,6 +1519,18 @@ impl CowchatClient {
         Ok(serde_json::from_value(response.payload)?)
     }
 
+    pub async fn provision_native_append_grant(
+        &self,
+        payload: &ProvisionNativeAppendGrantPayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::ProvisionNativeAppendGrant,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Convenience: return the agent_id currently holding the turn token in `room_id`,
     /// or None if the room is empty.
     pub async fn current_turn_holder(&self, room_id: &str) -> Result<Option<String>, ClientError> {
