@@ -64,6 +64,7 @@ pub fn prepare_native_room_wide_message(
 
 /// Native seat material needed to seal one focused hosted send.
 pub struct NativeFocusedMaterial<'a> {
+    pub chain_instance_id: [u8; 32],
     pub header: &'a cowchat_crypto::native_actor::HumanFocusedHeaderV1,
     pub generation_secret: &'a [u8; 32],
     pub signing_seed: &'a [u8; 32],
@@ -72,6 +73,7 @@ pub struct NativeFocusedMaterial<'a> {
 }
 
 pub struct NativeRoomWideMaterial<'a> {
+    pub chain_instance_id: [u8; 32],
     pub header: &'a cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
     pub generation_secret: &'a [u8; 32],
     pub signing_seed: &'a [u8; 32],
@@ -134,6 +136,33 @@ pub fn prepare_native_focused_message(
     })
 }
 
+fn sign_native_routing_declaration(
+    chain_instance_id: [u8; 32],
+    room_id: [u8; 32],
+    target_handle: &[u8],
+    signed_intent: &[u8],
+    signing_seed: &[u8; 32],
+) -> Result<Vec<u8>, ClientError> {
+    let preimage = cowchat_core::native_route::native_room_intent_signing_preimage_v1(
+        chain_instance_id,
+        room_id,
+        target_handle,
+        signed_intent,
+    )
+    .ok_or_else(|| ClientError::Encryption("invalid native Routing declaration".into()))?;
+    let signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    cowchat_core::native_route::native_room_intent_wire_bytes_v1(
+        chain_instance_id,
+        room_id,
+        target_handle,
+        signed_intent,
+        signature,
+    )
+    .ok_or_else(|| ClientError::Encryption("invalid native Routing declaration".into()))
+}
+
 /// Seal hosted and native views from one plaintext. Persist the returned
 /// payload for exact retry. The server authenticates the native bytes but
 /// cannot decrypt either view, so the client constructs both together.
@@ -166,6 +195,13 @@ pub fn prepare_hosted_native_focused_message(
         native.expected_record_signing_key,
         native.claim_generation,
     )?;
+    let native_routing_intent = sign_native_routing_declaration(
+        native.chain_instance_id,
+        native.header.room_id,
+        target_handle.as_bytes(),
+        &prepared.signed_intent,
+        native.signing_seed,
+    )?;
     let mut payload = CowchatClient::prepare_room_key_message(
         hosted_key,
         context,
@@ -178,6 +214,7 @@ pub fn prepare_hosted_native_focused_message(
         target_handle: target_handle.into(),
         sealed_record_hex: hex::encode(prepared.sealed_record),
         signed_intent_hex: hex::encode(prepared.signed_intent),
+        native_routing_intent_hex: hex::encode(native_routing_intent),
     });
     Ok(payload)
 }
@@ -209,6 +246,13 @@ pub fn prepare_hosted_native_room_wide_message(
         native.signing_seed,
         native.expected_record_signing_key,
     )?;
+    let native_routing_intent = sign_native_routing_declaration(
+        native.chain_instance_id,
+        native.header.room_id,
+        b"",
+        &prepared.signed_intent,
+        native.signing_seed,
+    )?;
     let mut payload = CowchatClient::prepare_room_key_message(
         hosted_key,
         context,
@@ -220,6 +264,7 @@ pub fn prepare_hosted_native_room_wide_message(
     payload.native_room_wide = Some(NativeRoomWideSend {
         sealed_record_hex: hex::encode(prepared.sealed_record),
         signed_intent_hex: hex::encode(prepared.signed_intent),
+        native_routing_intent_hex: hex::encode(native_routing_intent),
     });
     Ok(payload)
 }
@@ -378,6 +423,7 @@ mod tests {
             &context,
             "ordinary room message",
             NativeRoomWideMaterial {
+                chain_instance_id: [0x79; 32],
                 header: &header,
                 generation_secret: &native_secret,
                 signing_seed: &key.to_bytes(),
@@ -394,6 +440,14 @@ mod tests {
         let persisted = serde_json::to_vec(&payload).unwrap();
         let retry: SendMessagePayload = serde_json::from_slice(&persisted).unwrap();
         let native = retry.native_room_wide.unwrap();
+        let declaration = hex::decode(&native.native_routing_intent_hex).unwrap();
+        assert_eq!(
+            &declaration[..8],
+            cowchat_core::native_route::NATIVE_INTENT_MAGIC_V1
+        );
+        assert_eq!(&declaration[9..41], &[0x79; 32]);
+        assert_eq!(&declaration[41..73], &header.room_id);
+        assert_eq!(declaration[73], 0);
         let sealed = hex::decode(native.sealed_record_hex).unwrap();
         let opened = open_room_wide_source_seat_record_v1(
             &sealed,
@@ -444,6 +498,7 @@ mod tests {
             "forecast",
             "financial_planner",
             NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
                 header: &header,
                 generation_secret: &native_secret,
                 signing_seed: &key.to_bytes(),
@@ -459,6 +514,15 @@ mod tests {
         );
         let focused = payload.native_focused.unwrap();
         assert_eq!(focused.target_handle, "financial_planner");
+        let declaration = hex::decode(&focused.native_routing_intent_hex).unwrap();
+        assert_eq!(
+            &declaration[..8],
+            cowchat_core::native_route::NATIVE_INTENT_MAGIC_V1
+        );
+        assert_eq!(&declaration[9..41], &[0x39; 32]);
+        assert_eq!(&declaration[41..73], &header.room_id);
+        assert_eq!(declaration[73], b"financial_planner".len() as u8);
+        assert_eq!(&declaration[74..91], b"financial_planner");
         let native_record = hex::decode(focused.sealed_record_hex).unwrap();
         let opened = open_source_seat_record_v1(
             &native_record,
@@ -507,6 +571,7 @@ mod tests {
             "forecast",
             "financial_planner",
             NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
                 header: &header,
                 generation_secret: &native_secret,
                 signing_seed: &key.to_bytes(),
@@ -526,6 +591,7 @@ mod tests {
             "forecast",
             "financial_planner",
             NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
                 header: &header_with_reply,
                 generation_secret: &native_secret,
                 signing_seed: &key.to_bytes(),

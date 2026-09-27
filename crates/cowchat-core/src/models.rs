@@ -256,6 +256,9 @@ pub struct NativeFocusedSend {
     pub sealed_record_hex: String,
     /// Exact sender-signed pre-append intent, lowercase hex.
     pub signed_intent_hex: String,
+    /// Sender-signed declaration for the native Routing lane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_routing_intent_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +267,9 @@ pub struct NativeRoomWideSend {
     pub sealed_record_hex: String,
     /// Exact sender-signed untargeted pre-append intent, lowercase hex.
     pub signed_intent_hex: String,
+    /// Sender-signed declaration for the native Routing lane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_routing_intent_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
