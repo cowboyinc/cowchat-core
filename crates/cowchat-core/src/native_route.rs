@@ -2,12 +2,17 @@
 //!
 //! The canonical protocol decoder in Core must accept these exact bytes.
 
+use sha3::{Digest, Keccak256};
+
 pub const FOCUSED_SCOPE_V1: u8 = 2;
 pub const ROOM_WIDE_SCOPE_V1: u8 = 1;
 const VERSION_V1: u8 = 1;
 const SIGNATURE_DOMAIN_V1: &[u8] = b"cowboy/room-routing-intent/v1";
 const NATIVE_INTENT_DOMAIN_V1: &[u8] = b"cowboy/native-room-intent/v1";
 pub const NATIVE_INTENT_MAGIC_V1: &[u8; 8] = b"CBYRI001";
+pub const NATIVE_CONTROL_MAGIC_V1: &[u8; 8] = b"CBYRC001";
+const NATIVE_CONTROL_DOMAIN_V1: &[u8] = b"cowboy/native-room-control/v1";
+const NATIVE_COMMAND_ID_DOMAIN_V1: &[u8] = b"cowboy/native-room-command-id/v1";
 
 fn valid_handle(handle: &[u8]) -> bool {
     !handle.is_empty()
@@ -16,6 +21,119 @@ fn valid_handle(handle: &[u8]) -> bool {
         && handle[1..]
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+/// Stable native command identity for a hosted command ID. A retry must use
+/// the original hosted command ID and exact signed control bytes.
+pub fn native_room_command_id_v1(hosted_command_id: &str) -> Option<[u8; 32]> {
+    if hosted_command_id.is_empty() || hosted_command_id.len() > 128 {
+        return None;
+    }
+    let mut digest = Keccak256::new();
+    digest.update(NATIVE_COMMAND_ID_DOMAIN_V1);
+    digest.update((hosted_command_id.len() as u16).to_be_bytes());
+    digest.update(hosted_command_id.as_bytes());
+    Some(digest.finalize().into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NativeRoomControlKindV1 {
+    Claim = 1,
+    Release = 2,
+    Recover = 3,
+    WakeMode = 4,
+}
+
+/// Public preparation fields for a canonical native Routing control. The
+/// actor controller key is separate from the seat record key held by Runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeRoomControlV1 {
+    pub kind: NativeRoomControlKindV1,
+    pub chain_instance_id: [u8; 32],
+    pub room_id: [u8; 32],
+    pub command_id: [u8; 32],
+    pub handle: Vec<u8>,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    /// 0 for claims, releases and recovery; 1 or 2 for wake mode.
+    pub wake_mode: u8,
+    pub controller_signing_key: [u8; 32],
+}
+
+impl NativeRoomControlV1 {
+    pub fn valid(&self) -> bool {
+        self.chain_instance_id != [0; 32]
+            && self.room_id != [0; 32]
+            && self.command_id != [0; 32]
+            && self.seat_id != [0; 32]
+            && self.generation != 0
+            && match self.kind {
+                NativeRoomControlKindV1::Claim | NativeRoomControlKindV1::Release => {
+                    valid_handle(&self.handle)
+                        && self.wake_mode == 0
+                        && self.controller_signing_key != [0; 32]
+                }
+                NativeRoomControlKindV1::Recover => {
+                    valid_handle(&self.handle)
+                        && self.wake_mode == 0
+                        && self.controller_signing_key == [0; 32]
+                }
+                NativeRoomControlKindV1::WakeMode => {
+                    self.handle.is_empty()
+                        && matches!(self.wake_mode, 1 | 2)
+                        && self.controller_signing_key != [0; 32]
+                }
+            }
+    }
+
+    pub fn signing_preimage(&self) -> Option<Vec<u8>> {
+        if !self.valid() {
+            return None;
+        }
+        let mut bytes =
+            Vec::with_capacity(NATIVE_CONTROL_DOMAIN_V1.len() + 172 + self.handle.len());
+        bytes.extend_from_slice(NATIVE_CONTROL_DOMAIN_V1);
+        bytes.push(1);
+        bytes.push(self.kind as u8);
+        bytes.extend_from_slice(&self.chain_instance_id);
+        bytes.extend_from_slice(&self.room_id);
+        bytes.extend_from_slice(&self.command_id);
+        bytes.push(self.handle.len() as u8);
+        bytes.extend_from_slice(&self.handle);
+        bytes.extend_from_slice(&self.seat_id);
+        bytes.extend_from_slice(&self.generation.to_be_bytes());
+        bytes.push(self.wake_mode);
+        bytes.extend_from_slice(&self.controller_signing_key);
+        Some(bytes)
+    }
+
+    /// Controller signature and owner signature are mutually exclusive. The
+    /// unused signature must be all zeroes, as required by Core's decoder.
+    pub fn wire_bytes(
+        &self,
+        controller_signature: [u8; 64],
+        owner_signature: [u8; 65],
+    ) -> Option<Vec<u8>> {
+        let preimage = self.signing_preimage()?;
+        match self.kind {
+            NativeRoomControlKindV1::Recover
+                if controller_signature != [0; 64] || owner_signature == [0; 65] =>
+            {
+                return None;
+            }
+            NativeRoomControlKindV1::Recover => {}
+            _ if owner_signature != [0; 65] || controller_signature == [0; 64] => return None,
+            _ => {}
+        }
+        let mut bytes =
+            Vec::with_capacity(8 + preimage.len() - NATIVE_CONTROL_DOMAIN_V1.len() + 64 + 65);
+        bytes.extend_from_slice(NATIVE_CONTROL_MAGIC_V1);
+        bytes.extend_from_slice(&preimage[NATIVE_CONTROL_DOMAIN_V1.len()..]);
+        bytes.extend_from_slice(&controller_signature);
+        bytes.extend_from_slice(&owner_signature);
+        Some(bytes)
+    }
 }
 
 /// The sender signs its typed handle and already signed V1 routing intent as
@@ -176,6 +294,54 @@ impl RoomWideRoutingIntentV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_control_bytes_keep_command_and_authority_separate() {
+        let command_id = native_room_command_id_v1("prepared-command-id").unwrap();
+        assert_eq!(
+            command_id,
+            native_room_command_id_v1("prepared-command-id").unwrap()
+        );
+        assert_ne!(
+            command_id,
+            native_room_command_id_v1("another-command-id").unwrap()
+        );
+        let claim = NativeRoomControlV1 {
+            kind: NativeRoomControlKindV1::Claim,
+            chain_instance_id: [0x21; 32],
+            room_id: [0x22; 32],
+            command_id,
+            handle: b"financial_planner".to_vec(),
+            seat_id: [0x23; 32],
+            generation: 1,
+            wake_mode: 0,
+            controller_signing_key: [0x24; 32],
+        };
+        let preimage = claim.signing_preimage().unwrap();
+        let wire = claim.wire_bytes([0x25; 64], [0; 65]).unwrap();
+        assert_eq!(&wire[..8], NATIVE_CONTROL_MAGIC_V1);
+        assert_eq!(
+            &wire[8..wire.len() - 129],
+            &preimage[NATIVE_CONTROL_DOMAIN_V1.len()..]
+        );
+        assert_eq!(&wire[wire.len() - 129..wire.len() - 65], &[0x25; 64]);
+        assert!(claim.wire_bytes([0x25; 64], [0x26; 65]).is_none());
+        assert!(NativeRoomControlV1 {
+            kind: NativeRoomControlKindV1::Recover,
+            controller_signing_key: [0; 32],
+            ..claim.clone()
+        }
+        .wire_bytes([0; 64], [0x26; 65])
+        .is_some());
+        assert!(NativeRoomControlV1 {
+            kind: NativeRoomControlKindV1::WakeMode,
+            handle: Vec::new(),
+            wake_mode: 2,
+            ..claim
+        }
+        .wire_bytes([0x25; 64], [0; 65])
+        .is_some());
+    }
 
     #[test]
     fn room_wide_intent_has_no_target_or_claim_generation() {
