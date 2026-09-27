@@ -98,6 +98,7 @@ pub enum FrameType {
     DestroyRoom,
     SendMessage,
     EnrollNativeActorSeat,
+    EnrollNativeSourceSeat,
     ClaimActorHandle,
     ReleaseActorHandle,
     SetActorWakeMode,

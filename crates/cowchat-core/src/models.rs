@@ -264,6 +264,15 @@ pub struct EnrollNativeActorSeatPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollNativeSourceSeatPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub finalized_proof: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseActorHandlePayload {
     pub room_id: String,
     pub command_id: String,
