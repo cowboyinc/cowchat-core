@@ -333,6 +333,20 @@ pub struct EnrollNativeSourceSeatPayload {
     pub finalized_proof: Vec<u8>,
 }
 
+/// Non-secret coordinates verified from the finalized source-seat proof.
+/// A client can write its local send configuration without copying chain
+/// values from the proof by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSourceEnrollment {
+    pub native_room_id: [u8; 32],
+    pub room_owner_address: [u8; 20],
+    pub chain_id: u64,
+    pub source_seat_id: [u8; 32],
+    pub key_binding_commitment: [u8; 32],
+    pub key_generation: u64,
+    pub record_signing_key: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseActorHandlePayload {
     pub room_id: String,
