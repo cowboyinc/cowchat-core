@@ -8,6 +8,7 @@ pub mod envelope;
 mod fields;
 pub mod keys;
 pub mod native_actor;
+pub mod paired_message_id;
 pub mod request;
 mod signatures;
 

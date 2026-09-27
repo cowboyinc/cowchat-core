@@ -82,6 +82,18 @@ pub fn decrypt(key: &[u8; 32], context: &Context<'_>, content: &str) -> Result<S
     {
         return Err(Error::Decrypt);
     }
+    if let Ok(id) = hex::decode(context.message_id) {
+        if let Ok(id) = <[u8; 32]>::try_from(id) {
+            if cowchat_crypto::paired_message_id::is_paired_message_id_v1(&id)
+                && !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
+                    &id,
+                    fields[4].as_bytes(),
+                )
+            {
+                return Err(Error::Decrypt);
+            }
+        }
+    }
     Ok(fields[4].clone())
 }
 

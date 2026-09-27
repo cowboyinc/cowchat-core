@@ -514,6 +514,11 @@ pub fn open_room_wide_source_seat_record_v1(
         &sealed.signature,
         generation_secret,
     )?;
+    if crate::paired_message_id::is_paired_message_id_v1(&header.message_id)
+        && !crate::paired_message_id::verify_paired_message_id_v1(&header.message_id, &plaintext)
+    {
+        return Err(Error::Decrypt);
+    }
     Ok(OpenedSourceSeatRecordV1 {
         message_id: header.message_id,
         reply_to: header.reply_to,
@@ -550,6 +555,11 @@ pub fn open_source_seat_record_v1(
         &sealed.signature,
         generation_secret,
     )?;
+    if crate::paired_message_id::is_paired_message_id_v1(&checked.message_id)
+        && !crate::paired_message_id::verify_paired_message_id_v1(&checked.message_id, &plaintext)
+    {
+        return Err(Error::Decrypt);
+    }
     Ok(OpenedSourceSeatRecordV1 {
         message_id: checked.message_id,
         reply_to: checked.reply_to,

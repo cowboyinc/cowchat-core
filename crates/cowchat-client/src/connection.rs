@@ -146,6 +146,10 @@ pub fn prepare_hosted_native_focused_message(
     reply_to: Option<&str>,
 ) -> Result<SendMessagePayload, ClientError> {
     if context.message_id != hex::encode(native.header.message_id)
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
+            &native.header.message_id,
+            content.as_bytes(),
+        )
         || target_handle.is_empty()
         || target_handle.starts_with('@')
         || reply_to != native.header.reply_to.map(hex::encode).as_deref()
@@ -188,6 +192,10 @@ pub fn prepare_hosted_native_room_wide_message(
     reply_to: Option<&str>,
 ) -> Result<SendMessagePayload, ClientError> {
     if context.message_id != hex::encode(native.header.message_id)
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
+            &native.header.message_id,
+            content.as_bytes(),
+        )
         || reply_to != native.header.reply_to.map(hex::encode).as_deref()
     {
         return Err(ClientError::Encryption(
@@ -344,13 +352,17 @@ mod tests {
     #[test]
     fn hosted_room_wide_prepare_retains_both_encrypted_views() {
         let key = SigningKey::from_bytes(&[0x71; 32]);
+        let paired_id = cowchat_crypto::paired_message_id::paired_message_id_v1(
+            [0x75; 12],
+            b"ordinary room message",
+        );
         let header = HumanRoomWideHeaderV1 {
             chain_id: 7,
             room_id: [0x72; 32],
             seat_id: [0x73; 32],
             key_binding_commitment: [0x74; 32],
             key_generation: 2,
-            message_id: [0x75; 32],
+            message_id: paired_id,
             reply_to: None,
         };
         let message_id = hex::encode(header.message_id);
@@ -398,18 +410,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"ordinary room message");
+        let divergent =
+            cowchat_core::room_crypto::encrypt(&hosted_key, &context, "other text").unwrap();
+        assert!(cowchat_core::room_crypto::decrypt(&hosted_key, &context, &divergent).is_err());
     }
 
     #[test]
     fn focused_hosted_prepare_seals_both_views_from_one_plaintext() {
         let key = SigningKey::from_bytes(&[0x31; 32]);
+        let paired_id =
+            cowchat_crypto::paired_message_id::paired_message_id_v1([0x35; 12], b"forecast");
         let header = HumanFocusedHeaderV1 {
             chain_id: 7,
             room_id: [0x32; 32],
             seat_id: [0x33; 32],
             key_binding_commitment: [0x34; 32],
             key_generation: 2,
-            message_id: [0x35; 32],
+            message_id: paired_id,
             target_seat_id: [0x36; 32],
             reply_to: None,
         };
@@ -459,6 +476,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"forecast");
+        let divergent = prepare_native_focused_message(
+            &header,
+            &native_secret,
+            b"other text",
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+            1,
+        )
+        .unwrap();
+        assert!(open_source_seat_record_v1(
+            &divergent.sealed_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
+        )
+        .is_err());
         let different_reply = hex::encode([0x39; 32]);
         assert!(prepare_hosted_native_focused_message(
             &hosted_key,
