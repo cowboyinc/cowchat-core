@@ -372,6 +372,9 @@ pub struct EnrollNativeSourceSeatPayload {
 /// values from the proof by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSourceEnrollment {
+    /// Verified native network identity for signed Routing declarations.
+    #[serde(default)]
+    pub chain_instance_id: [u8; 32],
     pub native_room_id: [u8; 32],
     pub room_owner_address: [u8; 20],
     pub chain_id: u64,
