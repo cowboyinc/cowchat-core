@@ -99,6 +99,7 @@ pub enum FrameType {
     SendMessage,
     EnrollNativeActorSeat,
     BindOwnerLog,
+    GetOwnerLogBindingContext,
     EnrollNativeSourceSeat,
     ProvisionNativeAppendGrant,
     GetNativeRouteStatus,

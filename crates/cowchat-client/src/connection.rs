@@ -1702,6 +1702,19 @@ impl CowchatClient {
         Ok(())
     }
 
+    pub async fn owner_log_binding_context(
+        &self,
+        payload: &GetOwnerLogBindingContextPayload,
+    ) -> Result<OwnerLogBindingContext, ClientError> {
+        let response = self
+            .request(
+                FrameType::GetOwnerLogBindingContext,
+                serde_json::to_value(payload)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
     /// Enroll this authenticated member's native source seat in a hosted room.
     pub async fn enroll_native_source_seat(
         &self,

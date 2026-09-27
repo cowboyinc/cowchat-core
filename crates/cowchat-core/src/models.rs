@@ -338,6 +338,27 @@ pub struct BindOwnerLogPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOwnerLogBindingContextPayload {
+    pub room_id: String,
+    pub seat_id: [u8; 32],
+}
+
+/// Signing coordinates from the currently enrolled hosted seat. This is a
+/// preparation hint; binding submission refreshes finalized chain authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerLogBindingContext {
+    pub chain_instance_id: [u8; 32],
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub consumer_generation: u64,
+    pub record_signing_key: [u8; 32],
+    pub owner_stream_id: [u8; 32],
+    pub owner_id: String,
+    pub hosted_room_id: String,
+    pub room_lane_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollNativeSourceSeatPayload {
     pub room_id: String,
     pub command_id: String,
