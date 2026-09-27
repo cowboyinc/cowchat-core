@@ -17,6 +17,19 @@ pub struct PreparedNativeFocusedMessage {
     pub signed_intent: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendDeliveryStatus {
+    CommittedRoutingPending,
+    Routed,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedSendResult {
+    pub message: ChatMessage,
+    pub delivery_status: Option<SendDeliveryStatus>,
+}
+
 /// Prepare one native sealed record and one pre-append focused intent. Retain
 /// both exact byte strings for retry after an uncertain network result.
 pub fn prepare_native_focused_message(
@@ -469,6 +482,8 @@ mod tests {
 pub enum ClientError {
     #[error("room encryption: {0}")]
     Encryption(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -1954,12 +1969,38 @@ impl CowchatClient {
         &self,
         payload: &SendMessagePayload,
     ) -> Result<ChatMessage, ClientError> {
+        Ok(self
+            .append_prepared_message_with_status(payload)
+            .await?
+            .message)
+    }
+
+    /// A focused native send reports `CommittedRoutingPending` until an inbox
+    /// receipt exists. The response does not claim the actor has been woken.
+    pub async fn append_prepared_message_with_status(
+        &self,
+        payload: &SendMessagePayload,
+    ) -> Result<PreparedSendResult, ClientError> {
         let response = self
             .request(FrameType::SendMessage, serde_json::to_value(payload)?)
             .await?;
+        let delivery_status = response
+            .payload
+            .get("delivery_status")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        if payload.native_focused.is_some() && delivery_status.is_none() {
+            return Err(ClientError::Protocol(
+                "focused send response omitted routing status".into(),
+            ));
+        }
         let mut message: ChatMessage = serde_json::from_value(response.payload)?;
         self.decrypt_message(&mut message);
-        Ok(message)
+        Ok(PreparedSendResult {
+            message,
+            delivery_status,
+        })
     }
 
     // --- Webhook subscriptions ---
