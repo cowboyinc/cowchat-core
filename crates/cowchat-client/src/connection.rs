@@ -1209,6 +1209,24 @@ impl CowchatClient {
         )
     }
 
+    /// Prepare a room-wide send with the verified hosted key already opened
+    /// by this member session. Save the returned payload before submitting it.
+    pub fn prepare_cached_hosted_native_room_wide_message(
+        &self,
+        context: &cowchat_core::room_crypto::Context<'_>,
+        content: &str,
+        native: NativeRoomWideMaterial<'_>,
+        reply_to: Option<&str>,
+    ) -> Result<SendMessagePayload, ClientError> {
+        prepare_hosted_native_room_wide_message(
+            self.hosted_key(context.room_id, context.key_epoch)?,
+            context,
+            content,
+            native,
+            reply_to,
+        )
+    }
+
     pub(crate) fn hosted_key(
         &self,
         room_id: &str,
