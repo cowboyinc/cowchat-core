@@ -1466,6 +1466,18 @@ impl CowchatClient {
         Ok(())
     }
 
+    pub async fn recover_actor_handle(
+        &self,
+        payload: &RecoverActorHandlePayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::RecoverActorHandle,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn prepare_actor_handle_release(
         room_id: &str,
         handle: &str,

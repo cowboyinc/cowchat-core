@@ -325,6 +325,17 @@ pub struct ReleaseActorHandlePayload {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    /// Hex-encoded 65-byte recoverable secp256k1 signature by the room owner.
+    pub owner_signature: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorWakeMode {

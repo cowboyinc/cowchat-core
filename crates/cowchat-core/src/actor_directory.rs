@@ -62,6 +62,23 @@ pub fn release_preimage(
     )
 }
 
+pub fn recovery_preimage(
+    room_id: &str,
+    command_id: &str,
+    handle: &str,
+    seat_id: &[u8; 32],
+    generation: u64,
+) -> Vec<u8> {
+    let mut bytes = b"cowchat/actor-handle-owner-recovery/v1\0".to_vec();
+    for field in [room_id.as_bytes(), command_id.as_bytes(), handle.as_bytes()] {
+        bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes.extend_from_slice(seat_id);
+    bytes.extend_from_slice(&generation.to_be_bytes());
+    bytes
+}
+
 pub fn wake_mode_preimage(
     room_id: &str,
     command_id: &str,
@@ -126,6 +143,31 @@ mod tests {
                 1,
                 ActorWakeMode::AllMessages
             )
+        );
+    }
+
+    #[test]
+    fn recovery_bytes_bind_room_handle_seat_and_generation() {
+        let base = recovery_preimage("room-a", "one", "financial_planner", &[1; 32], 1);
+        assert_ne!(
+            base,
+            recovery_preimage("room-b", "one", "financial_planner", &[1; 32], 1)
+        );
+        assert_ne!(
+            base,
+            recovery_preimage("room-a", "two", "financial_planner", &[1; 32], 1)
+        );
+        assert_ne!(
+            base,
+            recovery_preimage("room-a", "one", "other", &[1; 32], 1)
+        );
+        assert_ne!(
+            base,
+            recovery_preimage("room-a", "one", "financial_planner", &[2; 32], 1)
+        );
+        assert_ne!(
+            base,
+            recovery_preimage("room-a", "one", "financial_planner", &[1; 32], 2)
         );
     }
 }

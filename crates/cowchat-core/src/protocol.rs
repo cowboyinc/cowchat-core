@@ -103,6 +103,7 @@ pub enum FrameType {
     GetNativeRouteStatus,
     ClaimActorHandle,
     ReleaseActorHandle,
+    RecoverActorHandle,
     SetActorWakeMode,
     ResolveActorHandle,
     GetHistory,
