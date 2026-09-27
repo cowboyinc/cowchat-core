@@ -1531,6 +1531,23 @@ impl CowchatClient {
         Ok(())
     }
 
+    pub async fn native_route_status(
+        &self,
+        room_id: &str,
+        message_id: &str,
+    ) -> Result<NativeRouteStatus, ClientError> {
+        let response = self
+            .request(
+                FrameType::GetNativeRouteStatus,
+                serde_json::to_value(GetNativeRouteStatusPayload {
+                    room_id: room_id.into(),
+                    message_id: message_id.into(),
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
     /// Convenience: return the agent_id currently holding the turn token in `room_id`,
     /// or None if the room is empty.
     pub async fn current_turn_holder(&self, room_id: &str) -> Result<Option<String>, ClientError> {

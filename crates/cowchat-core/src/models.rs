@@ -265,6 +265,26 @@ pub struct ProvisionNativeAppendGrantPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNativeRouteStatusPayload {
+    pub room_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeRouteStatus {
+    pub room_id: String,
+    pub message_id: String,
+    /// `committed_routing_pending` or `routed`.
+    pub delivery_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimActorHandlePayload {
     pub room_id: String,
     pub command_id: String,
