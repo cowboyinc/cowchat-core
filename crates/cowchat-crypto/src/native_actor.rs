@@ -63,6 +63,16 @@ pub struct ExpectedSourceSeatRecordV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedRoomWideSourceSeatRecordV1 {
+    pub chain_id: u64,
+    pub room_id: [u8; 32],
+    pub source_seat_id: [u8; 32],
+    pub source_seat_kind: SourceSeatKindV1,
+    pub source_key_binding_commitment: [u8; 32],
+    pub key_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenedSourceSeatRecordV1 {
     pub message_id: [u8; 32],
     pub reply_to: Option<[u8; 32]>,
@@ -101,6 +111,100 @@ pub struct HumanFocusedHeaderV1 {
     pub message_id: [u8; 32],
     pub target_seat_id: [u8; 32],
     pub reply_to: Option<[u8; 32]>,
+}
+
+/// A human-authored room message that may reach actors only through their
+/// independently authorized all-message subscriptions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanRoomWideHeaderV1 {
+    pub chain_id: u64,
+    pub room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub key_binding_commitment: [u8; 32],
+    pub key_generation: u64,
+    pub message_id: [u8; 32],
+    pub reply_to: Option<[u8; 32]>,
+}
+
+pub fn human_room_wide_header_v1(message: &HumanRoomWideHeaderV1) -> Result<Vec<u8>> {
+    if message.chain_id == 0 || message.key_generation == 0 {
+        return Err(Error::Schema);
+    }
+    for value in [
+        &message.room_id,
+        &message.seat_id,
+        &message.key_binding_commitment,
+        &message.message_id,
+    ] {
+        nonzero_32(value)?;
+    }
+    let reply_to = message
+        .reply_to
+        .map(|id| Value::Text(hex32(&id)))
+        .unwrap_or(Value::Null);
+    canonical::encode(Value::Map(vec![
+        (Value::Text("v".into()), Value::Integer(3.into())),
+        (
+            Value::Text("message_id".into()),
+            Value::Text(hex32(&message.message_id)),
+        ),
+        (
+            Value::Text("chain_id".into()),
+            Value::Integer(message.chain_id.into()),
+        ),
+        (
+            Value::Text("room".into()),
+            Value::Text(hex32(&message.room_id)),
+        ),
+        (
+            Value::Text("seat".into()),
+            Value::Text(hex32(&message.seat_id)),
+        ),
+        (Value::Text("role".into()), Value::Text("human".into())),
+        (Value::Text("via".into()), Value::Null),
+        (Value::Text("via_sender".into()), Value::Null),
+        (Value::Text("class".into()), Value::Text("message".into())),
+        (Value::Text("reply_to".into()), reply_to),
+        (Value::Text("mentions".into()), Value::Array(vec![])),
+        (
+            Value::Text("wake_hint".into()),
+            Value::Text("normal".into()),
+        ),
+        (
+            Value::Text("gen".into()),
+            Value::Integer(message.key_generation.into()),
+        ),
+        (
+            Value::Text("cert".into()),
+            Value::Text(hex32(&message.key_binding_commitment)),
+        ),
+        (
+            Value::Text("nonce".into()),
+            Value::Text("AAAAAAAAAAAAAAAA".into()),
+        ),
+    ]))
+}
+
+pub fn seal_human_room_wide_message_v1(
+    message: &HumanRoomWideHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    if SigningKey::from_bytes(signing_seed)
+        .verifying_key()
+        .to_bytes()
+        != *expected_record_signing_key
+    {
+        return Err(Error::Authority);
+    }
+    envelope::seal(
+        &human_room_wide_header_v1(message)?,
+        generation_secret,
+        plaintext,
+        signing_seed,
+    )
 }
 
 pub fn human_focused_header_v1(message: &HumanFocusedHeaderV1) -> Result<Vec<u8>> {
@@ -338,6 +442,86 @@ pub fn authenticate_source_seat_header_v1(
     })
 }
 
+/// Authenticate a room-wide record with no explicit actor mentions. An inbox
+/// consumer must separately verify its own historical subscription.
+pub fn authenticate_room_wide_source_seat_header_v1(
+    sealed_record: &[u8],
+    expected: &ExpectedRoomWideSourceSeatRecordV1,
+    source_record_signing_key: &[u8; 32],
+) -> Result<AuthenticatedSourceSeatHeaderV1> {
+    let expected_role = expected.source_seat_kind.header_role()?;
+    nonzero_32(source_record_signing_key)?;
+    if expected.chain_id == 0 || expected.key_generation == 0 {
+        return Err(Error::Schema);
+    }
+    for value in [
+        &expected.room_id,
+        &expected.source_seat_id,
+        &expected.source_key_binding_commitment,
+    ] {
+        nonzero_32(value)?;
+    }
+    let sealed = parse_sealed_record(sealed_record)?;
+    envelope::verify_record(
+        &sealed.header,
+        &sealed.body,
+        source_record_signing_key,
+        &sealed.signature,
+    )?;
+    let fields = parse_header(&sealed.header)?;
+    let mentions = fields.strings("mentions")?;
+    if fields.uint("v")? != 3
+        || fields.uint("chain_id")? != expected.chain_id
+        || fields.text("room")? != hex32(&expected.room_id)
+        || fields.text("seat")? != hex32(&expected.source_seat_id)
+        || fields.text("role")? != expected_role
+        || fields.nullable_text("via")?.is_some()
+        || fields.nullable_text("via_sender")?.is_some()
+        || fields.text("class")? != "message"
+        || fields.text("wake_hint")? != "normal"
+        || fields.uint("gen")? != expected.key_generation
+        || fields.text("cert")? != hex32(&expected.source_key_binding_commitment)
+        || !mentions.is_empty()
+    {
+        return Err(Error::Scope);
+    }
+    Ok(AuthenticatedSourceSeatHeaderV1 {
+        message_id: parse_hex32(fields.text("message_id")?)?,
+        reply_to: fields
+            .nullable_text("reply_to")?
+            .map(parse_hex32)
+            .transpose()?,
+        mentions: Vec::new(),
+    })
+}
+
+pub fn open_room_wide_source_seat_record_v1(
+    sealed_record: &[u8],
+    expected: &ExpectedRoomWideSourceSeatRecordV1,
+    source_record_signing_key: &[u8; 32],
+    generation_secret: &[u8; 32],
+) -> Result<OpenedSourceSeatRecordV1> {
+    let header = authenticate_room_wide_source_seat_header_v1(
+        sealed_record,
+        expected,
+        source_record_signing_key,
+    )?;
+    let sealed = parse_sealed_record(sealed_record)?;
+    let plaintext = envelope::open(
+        &sealed.header,
+        &sealed.body,
+        source_record_signing_key,
+        &sealed.signature,
+        generation_secret,
+    )?;
+    Ok(OpenedSourceSeatRecordV1 {
+        message_id: header.message_id,
+        reply_to: header.reply_to,
+        mentions: header.mentions,
+        plaintext,
+    })
+}
+
 /// Verify the source seat signature, principal-kind role and every
 /// proof-derived identity coordinate before releasing plaintext to the caller.
 pub fn open_source_seat_record_v1(
@@ -567,6 +751,68 @@ mod focused_message_tests {
         assert_eq!(
             seal_human_focused_message_v1(&header, &secret, b"x", &[0x49; 32], &record_key),
             Err(Error::Authority)
+        );
+    }
+
+    #[test]
+    fn room_wide_human_record_has_no_sender_chosen_actor_target() {
+        let signing_seed = [0x51; 32];
+        let record_key = SigningKey::from_bytes(&signing_seed)
+            .verifying_key()
+            .to_bytes();
+        let header = HumanRoomWideHeaderV1 {
+            chain_id: 7,
+            room_id: [0x52; 32],
+            seat_id: [0x53; 32],
+            key_binding_commitment: [0x54; 32],
+            key_generation: 3,
+            message_id: [0x55; 32],
+            reply_to: None,
+        };
+        let secret = [0x56; 32];
+        let sealed = seal_human_room_wide_message_v1(
+            &header,
+            &secret,
+            b"ordinary room message",
+            &signing_seed,
+            &record_key,
+        )
+        .unwrap();
+        let expected = ExpectedRoomWideSourceSeatRecordV1 {
+            chain_id: header.chain_id,
+            room_id: header.room_id,
+            source_seat_id: header.seat_id,
+            source_seat_kind: SourceSeatKindV1::Human,
+            source_key_binding_commitment: header.key_binding_commitment,
+            key_generation: header.key_generation,
+        };
+        let authenticated =
+            authenticate_room_wide_source_seat_header_v1(&sealed, &expected, &record_key).unwrap();
+        assert_eq!(authenticated.message_id, header.message_id);
+        assert!(authenticated.mentions.is_empty());
+        let opened =
+            open_room_wide_source_seat_record_v1(&sealed, &expected, &record_key, &secret).unwrap();
+        assert_eq!(opened.plaintext, b"ordinary room message");
+        assert_eq!(
+            authenticate_source_seat_header_v1(
+                &sealed,
+                &ExpectedSourceSeatRecordV1 {
+                    chain_id: header.chain_id,
+                    room_id: header.room_id,
+                    source_seat_id: header.seat_id,
+                    source_seat_kind: SourceSeatKindV1::Human,
+                    source_key_binding_commitment: header.key_binding_commitment,
+                    key_generation: header.key_generation,
+                    target_seat_id: [0x57; 32],
+                },
+                &record_key,
+            ),
+            Err(Error::Scope)
+        );
+        let mut altered = sealed.clone();
+        *altered.last_mut().unwrap() ^= 1;
+        assert!(
+            authenticate_room_wide_source_seat_header_v1(&altered, &expected, &record_key).is_err()
         );
     }
 }

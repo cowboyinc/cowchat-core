@@ -17,6 +17,51 @@ pub struct PreparedNativeFocusedMessage {
     pub signed_intent: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PreparedNativeRoomWideMessage {
+    pub message_id: [u8; 32],
+    pub sealed_record: Vec<u8>,
+    pub signed_intent: Vec<u8>,
+}
+
+pub fn prepare_native_room_wide_message(
+    header: &cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+) -> Result<PreparedNativeRoomWideMessage, ClientError> {
+    let sealed_record = cowchat_crypto::native_actor::seal_human_room_wide_message_v1(
+        header,
+        generation_secret,
+        plaintext,
+        signing_seed,
+        expected_record_signing_key,
+    )
+    .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut intent = cowchat_core::native_route::RoomWideRoutingIntentV1 {
+        room_id: header.room_id,
+        source_seat_id: header.seat_id,
+        message_id: header.message_id,
+        message_commitment: Sha256::digest(&sealed_record).into(),
+        signature: [0; 64],
+    };
+    let preimage = intent
+        .signing_preimage()
+        .ok_or_else(|| ClientError::Encryption("invalid native room-wide route".into()))?;
+    intent.signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    let signed_intent = intent
+        .wire_bytes()
+        .ok_or_else(|| ClientError::Encryption("invalid native room-wide route".into()))?;
+    Ok(PreparedNativeRoomWideMessage {
+        message_id: header.message_id,
+        sealed_record,
+        signed_intent,
+    })
+}
+
 /// Native seat material needed to seal one focused hosted send.
 pub struct NativeFocusedMaterial<'a> {
     pub header: &'a cowchat_crypto::native_actor::HumanFocusedHeaderV1,
@@ -152,8 +197,9 @@ async fn read_frame_line<R: AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
     use cowchat_crypto::native_actor::{
-        open_source_seat_record_v1, ExpectedSourceSeatRecordV1, HumanFocusedHeaderV1,
-        SourceSeatKindV1,
+        open_room_wide_source_seat_record_v1, open_source_seat_record_v1,
+        ExpectedRoomWideSourceSeatRecordV1, ExpectedSourceSeatRecordV1, HumanFocusedHeaderV1,
+        HumanRoomWideHeaderV1, SourceSeatKindV1,
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -202,6 +248,52 @@ mod tests {
         let commitment = Sha256::digest(&prepared.sealed_record);
         assert_eq!(&prepared.signed_intent[129..161], commitment.as_slice());
         assert_eq!(&prepared.signed_intent[65..97], &header.target_seat_id);
+    }
+
+    #[test]
+    fn room_wide_native_prepare_signs_untargeted_sealed_record() {
+        let key = SigningKey::from_bytes(&[0x61; 32]);
+        let header = HumanRoomWideHeaderV1 {
+            chain_id: 7,
+            room_id: [0x62; 32],
+            seat_id: [0x63; 32],
+            key_binding_commitment: [0x64; 32],
+            key_generation: 2,
+            message_id: [0x65; 32],
+            reply_to: None,
+        };
+        let secret = [0x66; 32];
+        let prepared = prepare_native_room_wide_message(
+            &header,
+            &secret,
+            b"ordinary room message",
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(prepared.signed_intent.len(), 234);
+        assert_eq!(&prepared.signed_intent[65..97], &[0; 32]);
+        assert_eq!(&prepared.signed_intent[161..169], &[0; 8]);
+        assert_eq!(prepared.signed_intent[169], 1);
+        assert_eq!(
+            &prepared.signed_intent[129..161],
+            Sha256::digest(&prepared.sealed_record).as_slice()
+        );
+        let opened = open_room_wide_source_seat_record_v1(
+            &prepared.sealed_record,
+            &ExpectedRoomWideSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+            },
+            &key.verifying_key().to_bytes(),
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"ordinary room message");
     }
 
     #[test]
