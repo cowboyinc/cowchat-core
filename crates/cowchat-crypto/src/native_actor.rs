@@ -191,70 +191,6 @@ pub fn seal_human_focused_message_v1(
     )
 }
 
-#[cfg(test)]
-mod focused_message_tests {
-    use super::*;
-
-    #[test]
-    fn focused_human_record_is_sealed_for_one_native_target() {
-        let signing_seed = [0x41; 32];
-        let record_key = SigningKey::from_bytes(&signing_seed)
-            .verifying_key()
-            .to_bytes();
-        let header = HumanFocusedHeaderV1 {
-            chain_id: 7,
-            room_id: [0x42; 32],
-            seat_id: [0x43; 32],
-            key_binding_commitment: [0x44; 32],
-            key_generation: 3,
-            message_id: [0x45; 32],
-            target_seat_id: [0x46; 32],
-            reply_to: None,
-        };
-        let secret = [0x47; 32];
-        let sealed = seal_human_focused_message_v1(
-            &header,
-            &secret,
-            b"payroll forecast",
-            &signing_seed,
-            &record_key,
-        )
-        .unwrap();
-        assert_eq!(
-            authenticated_record_message_id_v1(&sealed, &record_key).unwrap(),
-            header.message_id
-        );
-        let expected = ExpectedSourceSeatRecordV1 {
-            chain_id: header.chain_id,
-            room_id: header.room_id,
-            source_seat_id: header.seat_id,
-            source_seat_kind: SourceSeatKindV1::Human,
-            source_key_binding_commitment: header.key_binding_commitment,
-            key_generation: header.key_generation,
-            target_seat_id: header.target_seat_id,
-        };
-        let authenticated =
-            authenticate_source_seat_header_v1(&sealed, &expected, &record_key).unwrap();
-        assert_eq!(authenticated.message_id, header.message_id);
-        assert_eq!(authenticated.mentions, vec![header.target_seat_id]);
-        let opened = open_source_seat_record_v1(&sealed, &expected, &record_key, &secret).unwrap();
-        assert_eq!(opened.plaintext, b"payroll forecast");
-        assert_eq!(opened.mentions, vec![header.target_seat_id]);
-        let wrong = ExpectedSourceSeatRecordV1 {
-            target_seat_id: [0x48; 32],
-            ..expected
-        };
-        assert_eq!(
-            open_source_seat_record_v1(&sealed, &wrong, &record_key, &secret),
-            Err(Error::Scope)
-        );
-        assert_eq!(
-            seal_human_focused_message_v1(&header, &secret, b"x", &[0x49; 32], &record_key),
-            Err(Error::Authority)
-        );
-    }
-}
-
 struct SealedRecord {
     header: Vec<u8>,
     body: String,
@@ -569,4 +505,68 @@ pub fn open_actor_reply_v1(
         &sealed.signature,
         generation_secret,
     )
+}
+
+#[cfg(test)]
+mod focused_message_tests {
+    use super::*;
+
+    #[test]
+    fn focused_human_record_is_sealed_for_one_native_target() {
+        let signing_seed = [0x41; 32];
+        let record_key = SigningKey::from_bytes(&signing_seed)
+            .verifying_key()
+            .to_bytes();
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x42; 32],
+            seat_id: [0x43; 32],
+            key_binding_commitment: [0x44; 32],
+            key_generation: 3,
+            message_id: [0x45; 32],
+            target_seat_id: [0x46; 32],
+            reply_to: None,
+        };
+        let secret = [0x47; 32];
+        let sealed = seal_human_focused_message_v1(
+            &header,
+            &secret,
+            b"payroll forecast",
+            &signing_seed,
+            &record_key,
+        )
+        .unwrap();
+        assert_eq!(
+            authenticated_record_message_id_v1(&sealed, &record_key).unwrap(),
+            header.message_id
+        );
+        let expected = ExpectedSourceSeatRecordV1 {
+            chain_id: header.chain_id,
+            room_id: header.room_id,
+            source_seat_id: header.seat_id,
+            source_seat_kind: SourceSeatKindV1::Human,
+            source_key_binding_commitment: header.key_binding_commitment,
+            key_generation: header.key_generation,
+            target_seat_id: header.target_seat_id,
+        };
+        let authenticated =
+            authenticate_source_seat_header_v1(&sealed, &expected, &record_key).unwrap();
+        assert_eq!(authenticated.message_id, header.message_id);
+        assert_eq!(authenticated.mentions, vec![header.target_seat_id]);
+        let opened = open_source_seat_record_v1(&sealed, &expected, &record_key, &secret).unwrap();
+        assert_eq!(opened.plaintext, b"payroll forecast");
+        assert_eq!(opened.mentions, vec![header.target_seat_id]);
+        let wrong = ExpectedSourceSeatRecordV1 {
+            target_seat_id: [0x48; 32],
+            ..expected
+        };
+        assert_eq!(
+            open_source_seat_record_v1(&sealed, &wrong, &record_key, &secret),
+            Err(Error::Scope)
+        );
+        assert_eq!(
+            seal_human_focused_message_v1(&header, &secret, b"x", &[0x49; 32], &record_key),
+            Err(Error::Authority)
+        );
+    }
 }

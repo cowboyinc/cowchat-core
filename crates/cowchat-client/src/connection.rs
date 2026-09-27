@@ -17,6 +17,15 @@ pub struct PreparedNativeFocusedMessage {
     pub signed_intent: Vec<u8>,
 }
 
+/// Native seat material needed to seal one focused hosted send.
+pub struct NativeFocusedMaterial<'a> {
+    pub header: &'a cowchat_crypto::native_actor::HumanFocusedHeaderV1,
+    pub generation_secret: &'a [u8; 32],
+    pub signing_seed: &'a [u8; 32],
+    pub expected_record_signing_key: &'a [u8; 32],
+    pub claim_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendDeliveryStatus {
@@ -81,14 +90,10 @@ pub fn prepare_hosted_native_focused_message(
     context: &cowchat_core::room_crypto::Context<'_>,
     content: &str,
     target_handle: &str,
-    native_header: &cowchat_crypto::native_actor::HumanFocusedHeaderV1,
-    generation_secret: &[u8; 32],
-    signing_seed: &[u8; 32],
-    expected_record_signing_key: &[u8; 32],
-    claim_generation: u64,
+    native: NativeFocusedMaterial<'_>,
     reply_to: Option<&str>,
 ) -> Result<SendMessagePayload, ClientError> {
-    if context.message_id != hex::encode(native_header.message_id)
+    if context.message_id != hex::encode(native.header.message_id)
         || target_handle.is_empty()
         || target_handle.starts_with('@')
     {
@@ -96,13 +101,13 @@ pub fn prepare_hosted_native_focused_message(
             "hosted and native focused identities do not match".into(),
         ));
     }
-    let native = prepare_native_focused_message(
-        native_header,
-        generation_secret,
+    let prepared = prepare_native_focused_message(
+        native.header,
+        native.generation_secret,
         content.as_bytes(),
-        signing_seed,
-        expected_record_signing_key,
-        claim_generation,
+        native.signing_seed,
+        native.expected_record_signing_key,
+        native.claim_generation,
     )?;
     let mut payload = CowchatClient::prepare_room_key_message(
         hosted_key,
@@ -114,8 +119,8 @@ pub fn prepare_hosted_native_focused_message(
     )?;
     payload.native_focused = Some(NativeFocusedSend {
         target_handle: target_handle.into(),
-        sealed_record_hex: hex::encode(native.sealed_record),
-        signed_intent_hex: hex::encode(native.signed_intent),
+        sealed_record_hex: hex::encode(prepared.sealed_record),
+        signed_intent_hex: hex::encode(prepared.signed_intent),
     });
     Ok(payload)
 }
@@ -224,11 +229,13 @@ mod tests {
             &context,
             "forecast",
             "financial_planner",
-            &header,
-            &native_secret,
-            &key.to_bytes(),
-            &key.verifying_key().to_bytes(),
-            1,
+            NativeFocusedMaterial {
+                header: &header,
+                generation_secret: &native_secret,
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
             None,
         )
         .unwrap();

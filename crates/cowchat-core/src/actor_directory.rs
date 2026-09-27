@@ -2,6 +2,9 @@
 
 use crate::ActorWakeMode;
 
+// Every field is part of the signed room command; keeping them explicit
+// makes the canonical byte order visible at each call site.
+#[allow(clippy::too_many_arguments)]
 fn signed_preimage(
     action: &[u8],
     room_id: &str,
