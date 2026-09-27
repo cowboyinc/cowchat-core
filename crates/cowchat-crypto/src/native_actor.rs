@@ -71,6 +71,13 @@ pub struct OpenedSourceSeatRecordV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedSourceSeatHeaderV1 {
+    pub message_id: [u8; 32],
+    pub reply_to: Option<[u8; 32]>,
+    pub mentions: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActorReplyHeaderV1 {
     pub chain_id: u64,
     pub room_id: [u8; 32],
@@ -226,6 +233,10 @@ mod focused_message_tests {
             key_generation: header.key_generation,
             target_seat_id: header.target_seat_id,
         };
+        let authenticated =
+            authenticate_source_seat_header_v1(&sealed, &expected, &record_key).unwrap();
+        assert_eq!(authenticated.message_id, header.message_id);
+        assert_eq!(authenticated.mentions, vec![header.target_seat_id]);
         let opened = open_source_seat_record_v1(&sealed, &expected, &record_key, &secret).unwrap();
         assert_eq!(opened.plaintext, b"payroll forecast");
         assert_eq!(opened.mentions, vec![header.target_seat_id]);
@@ -364,6 +375,30 @@ fn check_source_seat_record_header(
         message_id,
         reply_to,
         mentions,
+    })
+}
+
+/// Authenticate the public route fields without opening the ciphertext.
+/// The expected source fields and key must come from finalized seat authority.
+pub fn authenticate_source_seat_header_v1(
+    sealed_record: &[u8],
+    expected: &ExpectedSourceSeatRecordV1,
+    source_record_signing_key: &[u8; 32],
+) -> Result<AuthenticatedSourceSeatHeaderV1> {
+    expected.source_seat_kind.header_role()?;
+    nonzero_32(source_record_signing_key)?;
+    let sealed = parse_sealed_record(sealed_record)?;
+    envelope::verify_record(
+        &sealed.header,
+        &sealed.body,
+        source_record_signing_key,
+        &sealed.signature,
+    )?;
+    let checked = check_source_seat_record_header(&sealed.header, expected)?;
+    Ok(AuthenticatedSourceSeatHeaderV1 {
+        message_id: checked.message_id,
+        reply_to: checked.reply_to,
+        mentions: checked.mentions,
     })
 }
 
