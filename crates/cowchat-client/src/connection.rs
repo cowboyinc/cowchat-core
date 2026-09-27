@@ -60,6 +60,53 @@ pub fn prepare_native_focused_message(
     })
 }
 
+/// Seal hosted and native views from one plaintext. Persist the returned
+/// payload for exact retry. The server authenticates the native bytes but
+/// cannot decrypt either view, so the client constructs both together.
+pub fn prepare_hosted_native_focused_message(
+    hosted_key: &[u8; 32],
+    context: &cowchat_core::room_crypto::Context<'_>,
+    content: &str,
+    target_handle: &str,
+    native_header: &cowchat_crypto::native_actor::HumanFocusedHeaderV1,
+    generation_secret: &[u8; 32],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+    claim_generation: u64,
+    reply_to: Option<&str>,
+) -> Result<SendMessagePayload, ClientError> {
+    if context.message_id != hex::encode(native_header.message_id)
+        || target_handle.is_empty()
+        || target_handle.starts_with('@')
+    {
+        return Err(ClientError::Encryption(
+            "hosted and native focused identities do not match".into(),
+        ));
+    }
+    let native = prepare_native_focused_message(
+        native_header,
+        generation_secret,
+        content.as_bytes(),
+        signing_seed,
+        expected_record_signing_key,
+        claim_generation,
+    )?;
+    let mut payload = CowchatClient::prepare_room_key_message(
+        hosted_key,
+        context,
+        content,
+        reply_to,
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    payload.native_focused = Some(NativeFocusedSend {
+        target_handle: target_handle.into(),
+        sealed_record_hex: hex::encode(native.sealed_record),
+        signed_intent_hex: hex::encode(native.signed_intent),
+    });
+    Ok(payload)
+}
+
 async fn read_frame_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<String>> {
@@ -136,6 +183,65 @@ mod tests {
         let commitment = Sha256::digest(&prepared.sealed_record);
         assert_eq!(&prepared.signed_intent[129..161], commitment.as_slice());
         assert_eq!(&prepared.signed_intent[65..97], &header.target_seat_id);
+    }
+
+    #[test]
+    fn focused_hosted_prepare_seals_both_views_from_one_plaintext() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x32; 32],
+            seat_id: [0x33; 32],
+            key_binding_commitment: [0x34; 32],
+            key_generation: 2,
+            message_id: [0x35; 32],
+            target_seat_id: [0x36; 32],
+            reply_to: None,
+        };
+        let message_id = hex::encode(header.message_id);
+        let context = cowchat_core::room_crypto::Context {
+            room_id: "hosted-room",
+            key_epoch: 2,
+            message_id: &message_id,
+        };
+        let hosted_key = [0x38; 32];
+        let native_secret = [0x37; 32];
+        let payload = prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            &header,
+            &native_secret,
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cowchat_core::room_crypto::decrypt(&hosted_key, &context, &payload.content).unwrap(),
+            "forecast"
+        );
+        let focused = payload.native_focused.unwrap();
+        assert_eq!(focused.target_handle, "financial_planner");
+        let native_record = hex::decode(focused.sealed_record_hex).unwrap();
+        let opened = open_source_seat_record_v1(
+            &native_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"forecast");
     }
 
     #[tokio::test]
@@ -1081,6 +1187,7 @@ impl CowchatClient {
             reply_to: reply_to.map(String::from),
             metadata,
             mentions,
+            native_focused: None,
         }
     }
 
@@ -1105,6 +1212,7 @@ impl CowchatClient {
             reply_to: reply_to.map(String::from),
             mentions,
             metadata,
+            native_focused: None,
         })
     }
 
@@ -1838,6 +1946,7 @@ impl CowchatClient {
             reply_to: Some(work.message_id.clone()),
             metadata: serde_json::json!({}),
             mentions,
+            native_focused: None,
         })
     }
 

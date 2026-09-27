@@ -239,6 +239,20 @@ pub struct SendMessagePayload {
     pub metadata: serde_json::Value,
     #[serde(default)]
     pub mentions: Vec<String>,
+    /// Sender-prepared native bytes for one room-local actor handle. The
+    /// hosted server validates and durably stores these before routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_focused: Option<NativeFocusedSend>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeFocusedSend {
+    /// Lowercase handle without the leading `@`.
+    pub target_handle: String,
+    /// Exact sealed Messages record, lowercase hex for the JSON transport.
+    pub sealed_record_hex: String,
+    /// Exact sender-signed pre-append intent, lowercase hex.
+    pub signed_intent_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

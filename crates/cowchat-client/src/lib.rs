@@ -1,6 +1,6 @@
 mod connection;
 
 pub use connection::{
-    prepare_native_focused_message, ActorReply, ClientError, CowchatClient, Event,
-    PreparedNativeFocusedMessage,
+    prepare_hosted_native_focused_message, prepare_native_focused_message, ActorReply, ClientError,
+    CowchatClient, Event, PreparedNativeFocusedMessage,
 };
