@@ -96,9 +96,10 @@ pub fn prepare_hosted_native_focused_message(
     if context.message_id != hex::encode(native.header.message_id)
         || target_handle.is_empty()
         || target_handle.starts_with('@')
+        || reply_to != native.header.reply_to.map(hex::encode).as_deref()
     {
         return Err(ClientError::Encryption(
-            "hosted and native focused identities do not match".into(),
+            "hosted and native focused identities or reply targets do not match".into(),
         ));
     }
     let prepared = prepare_native_focused_message(
@@ -262,6 +263,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"forecast");
+        let different_reply = hex::encode([0x39; 32]);
+        assert!(prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            NativeFocusedMaterial {
+                header: &header,
+                generation_secret: &native_secret,
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
+            Some(&different_reply),
+        )
+        .is_err());
+        let header_with_reply = HumanFocusedHeaderV1 {
+            reply_to: Some([0x39; 32]),
+            ..header
+        };
+        assert!(prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            NativeFocusedMaterial {
+                header: &header_with_reply,
+                generation_secret: &native_secret,
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
+            Some(&different_reply),
+        )
+        .is_ok());
     }
 
     #[tokio::test]
