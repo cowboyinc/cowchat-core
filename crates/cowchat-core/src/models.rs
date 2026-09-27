@@ -287,6 +287,13 @@ pub struct NativeRouteStatus {
     pub message_id: String,
     /// `committed_routing_pending` or `routed`.
     pub delivery_status: String,
+    /// `focused` or `room_wide` when the status refers to a native send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_targets: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_targets: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_sequence: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
