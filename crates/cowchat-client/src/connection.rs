@@ -1832,6 +1832,7 @@ impl CowchatClient {
             signing_key: signing_key.verifying_key().to_bytes(),
             generation,
             signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
         }
     }
 
@@ -1883,6 +1884,7 @@ impl CowchatClient {
             seat_id,
             generation,
             signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
         }
     }
 
@@ -1923,6 +1925,7 @@ impl CowchatClient {
             generation,
             mode,
             signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
         }
     }
 

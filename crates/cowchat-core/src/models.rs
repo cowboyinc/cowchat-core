@@ -319,6 +319,10 @@ pub struct ClaimActorHandlePayload {
     pub generation: u64,
     /// Hex-encoded Ed25519 signature by the seat's record key.
     pub signature: String,
+    /// Canonical controller-signed native Routing control. Older hosted
+    /// commands omit it; a new native claim must supply exact retry bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +402,8 @@ pub struct ReleaseActorHandlePayload {
     pub seat_id: [u8; 32],
     pub generation: u64,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +415,8 @@ pub struct RecoverActorHandlePayload {
     pub generation: u64,
     /// Hex-encoded 65-byte recoverable secp256k1 signature by the room owner.
     pub owner_signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +435,8 @@ pub struct SetActorWakeModePayload {
     pub generation: u64,
     pub mode: ActorWakeMode,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
