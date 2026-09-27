@@ -98,6 +98,7 @@ pub enum FrameType {
     DestroyRoom,
     SendMessage,
     EnrollNativeActorSeat,
+    BindOwnerLog,
     EnrollNativeSourceSeat,
     ProvisionNativeAppendGrant,
     GetNativeRouteStatus,

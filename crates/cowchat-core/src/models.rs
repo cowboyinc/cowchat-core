@@ -324,6 +324,19 @@ pub struct EnrollNativeActorSeatPayload {
     pub finalized_proof: Vec<u8>,
 }
 
+/// Joint native room-owner and actor-seat authorization for the hosted owner
+/// log used to prove historical handle claims and wake preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindOwnerLogPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub finalized_proof: Vec<u8>,
+    /// Canonical protocol-encoded RoomOwnerLogBindingV1 bytes.
+    pub binding_hex: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollNativeSourceSeatPayload {
     pub room_id: String,

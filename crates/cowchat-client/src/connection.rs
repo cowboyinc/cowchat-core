@@ -1694,6 +1694,14 @@ impl CowchatClient {
         Ok(())
     }
 
+    /// Commit a jointly signed owner-log locator after refreshing the exact
+    /// native room and seat proof. Keep this payload for exact retry.
+    pub async fn bind_owner_log(&self, payload: &BindOwnerLogPayload) -> Result<(), ClientError> {
+        self.request(FrameType::BindOwnerLog, serde_json::to_value(payload)?)
+            .await?;
+        Ok(())
+    }
+
     /// Enroll this authenticated member's native source seat in a hosted room.
     pub async fn enroll_native_source_seat(
         &self,
