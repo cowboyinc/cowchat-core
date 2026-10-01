@@ -239,6 +239,219 @@ pub struct SendMessagePayload {
     pub metadata: serde_json::Value,
     #[serde(default)]
     pub mentions: Vec<String>,
+    /// Sender-prepared native bytes for one room-local actor handle. The
+    /// hosted server validates and durably stores these before routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_focused: Option<NativeFocusedSend>,
+    /// Sender-prepared untargeted native bytes for a room-wide message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_room_wide: Option<NativeRoomWideSend>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeFocusedSend {
+    /// Lowercase handle without the leading `@`.
+    pub target_handle: String,
+    /// Exact sealed Messages record, lowercase hex for the JSON transport.
+    pub sealed_record_hex: String,
+    /// Exact sender-signed pre-append intent, lowercase hex.
+    pub signed_intent_hex: String,
+    /// Sender-signed declaration for the native Routing lane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_routing_intent_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeRoomWideSend {
+    /// Exact sealed Messages record, lowercase hex for the JSON transport.
+    pub sealed_record_hex: String,
+    /// Exact sender-signed untargeted pre-append intent, lowercase hex.
+    pub signed_intent_hex: String,
+    /// Sender-signed declaration for the native Routing lane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_routing_intent_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionNativeAppendGrantPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub lane_id: u64,
+    /// Owner-issued canonical `StreamGrantV2` bytes, lowercase hex.
+    pub grant_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNativeRouteStatusPayload {
+    pub room_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeRouteStatus {
+    pub room_id: String,
+    pub message_id: String,
+    /// `committed_routing_pending` or `routed`.
+    pub delivery_status: String,
+    /// `focused` or `room_wide` when the status refers to a native send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_targets: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_targets: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    /// Lowercase ASCII without the leading `@`.
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub signing_key: [u8; 32],
+    pub generation: u64,
+    /// Hex-encoded Ed25519 signature by the seat's record key.
+    pub signature: String,
+    /// Canonical controller-signed native Routing control. Older hosted
+    /// commands omit it; a new native claim must supply exact retry bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollNativeActorSeatPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub finalized_proof: Vec<u8>,
+}
+
+/// Joint native room-owner and actor-seat authorization for the hosted owner
+/// log used to prove historical handle claims and wake preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindOwnerLogPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub finalized_proof: Vec<u8>,
+    /// Canonical protocol-encoded RoomOwnerLogBindingV1 bytes.
+    pub binding_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOwnerLogBindingContextPayload {
+    pub room_id: String,
+    pub seat_id: [u8; 32],
+}
+
+/// Signing coordinates from the currently enrolled hosted seat. This is a
+/// preparation hint; binding submission refreshes finalized chain authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerLogBindingContext {
+    pub chain_instance_id: [u8; 32],
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub consumer_generation: u64,
+    pub record_signing_key: [u8; 32],
+    pub owner_stream_id: [u8; 32],
+    pub owner_id: String,
+    pub hosted_room_id: String,
+    pub room_lane_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollNativeSourceSeatPayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub native_room_id: [u8; 32],
+    pub seat_id: [u8; 32],
+    pub finalized_proof: Vec<u8>,
+}
+
+/// Non-secret coordinates verified from the finalized source-seat proof.
+/// A client can write its local send configuration without copying chain
+/// values from the proof by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSourceEnrollment {
+    /// Verified native network identity for signed Routing declarations.
+    #[serde(default)]
+    pub chain_instance_id: [u8; 32],
+    pub native_room_id: [u8; 32],
+    pub room_owner_address: [u8; 20],
+    pub chain_id: u64,
+    pub source_seat_id: [u8; 32],
+    pub key_binding_commitment: [u8; 32],
+    pub key_generation: u64,
+    pub record_signing_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverActorHandlePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    /// Hex-encoded 65-byte recoverable secp256k1 signature by the room owner.
+    pub owner_signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorWakeMode {
+    MentionsOnly,
+    AllMessages,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetActorWakeModePayload {
+    pub room_id: String,
+    pub command_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub mode: ActorWakeMode,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub native_control_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveActorHandlePayload {
+    pub room_id: String,
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedActorHandle {
+    pub room_id: String,
+    pub handle: String,
+    pub seat_id: [u8; 32],
+    pub generation: u64,
+    pub wake_mode: ActorWakeMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

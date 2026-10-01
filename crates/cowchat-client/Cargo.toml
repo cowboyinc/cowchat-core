@@ -11,8 +11,13 @@ zeroize = "1"
 # The browser's own room-context parser, release composition and owner setup
 # attempt; the member relay is the only transport.
 cowchat-core = { path = "../cowchat-core" }
+cowchat-crypto = { path = "../cowchat-crypto" }
+ed25519-dalek = "2.2"
+sha2 = "0.10"
+hex = "0.4"
 tokio = { version = "1", features = ["full", "net", "io-util", "sync", "rt", "macros", "time"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 log = "0.4"
 thiserror = "2"

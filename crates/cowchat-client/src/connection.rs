@@ -1,4 +1,6 @@
 use cowchat_core::*;
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,6 +9,285 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct PreparedNativeFocusedMessage {
+    pub message_id: [u8; 32],
+    pub sealed_record: Vec<u8>,
+    pub signed_intent: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedNativeRoomWideMessage {
+    pub message_id: [u8; 32],
+    pub sealed_record: Vec<u8>,
+    pub signed_intent: Vec<u8>,
+}
+
+pub fn prepare_native_room_wide_message(
+    header: &cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+) -> Result<PreparedNativeRoomWideMessage, ClientError> {
+    let sealed_record = cowchat_crypto::native_actor::seal_human_room_wide_message_v1(
+        header,
+        generation_secret,
+        plaintext,
+        signing_seed,
+        expected_record_signing_key,
+    )
+    .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut intent = cowchat_core::native_route::RoomWideRoutingIntentV1 {
+        room_id: header.room_id,
+        source_seat_id: header.seat_id,
+        message_id: header.message_id,
+        message_commitment: Sha256::digest(&sealed_record).into(),
+        signature: [0; 64],
+    };
+    let preimage = intent
+        .signing_preimage()
+        .ok_or_else(|| ClientError::Encryption("invalid native room-wide route".into()))?;
+    intent.signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    let signed_intent = intent
+        .wire_bytes()
+        .ok_or_else(|| ClientError::Encryption("invalid native room-wide route".into()))?;
+    Ok(PreparedNativeRoomWideMessage {
+        message_id: header.message_id,
+        sealed_record,
+        signed_intent,
+    })
+}
+
+/// Native seat material needed to seal one focused hosted send.
+pub struct NativeFocusedMaterial<'a> {
+    pub chain_instance_id: [u8; 32],
+    pub header: &'a cowchat_crypto::native_actor::HumanFocusedHeaderV1,
+    pub generation_secret: &'a [u8; 32],
+    pub paired_salt: &'a [u8; 32],
+    pub signing_seed: &'a [u8; 32],
+    pub expected_record_signing_key: &'a [u8; 32],
+    pub claim_generation: u64,
+}
+
+pub struct NativeRoomWideMaterial<'a> {
+    pub chain_instance_id: [u8; 32],
+    pub header: &'a cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
+    pub generation_secret: &'a [u8; 32],
+    pub paired_salt: &'a [u8; 32],
+    pub signing_seed: &'a [u8; 32],
+    pub expected_record_signing_key: &'a [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendDeliveryStatus {
+    CommittedRoutingPending,
+    Routed,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedSendResult {
+    pub message: ChatMessage,
+    pub delivery_status: Option<SendDeliveryStatus>,
+}
+
+/// Prepare one native sealed record and one pre-append focused intent. Retain
+/// both exact byte strings for retry after an uncertain network result.
+pub fn prepare_native_focused_message(
+    header: &cowchat_crypto::native_actor::HumanFocusedHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+    claim_generation: u64,
+) -> Result<PreparedNativeFocusedMessage, ClientError> {
+    let sealed_record = cowchat_crypto::native_actor::seal_human_focused_message_v1(
+        header,
+        generation_secret,
+        plaintext,
+        signing_seed,
+        expected_record_signing_key,
+    )
+    .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut intent = cowchat_core::native_route::FocusedRoutingIntentV1 {
+        room_id: header.room_id,
+        source_seat_id: header.seat_id,
+        target_seat_id: header.target_seat_id,
+        message_id: header.message_id,
+        message_commitment: Sha256::digest(&sealed_record).into(),
+        claim_generation,
+        signature: [0; 64],
+    };
+    let preimage = intent
+        .signing_preimage()
+        .ok_or_else(|| ClientError::Encryption("invalid native route".into()))?;
+    intent.signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    let signed_intent = intent
+        .wire_bytes()
+        .ok_or_else(|| ClientError::Encryption("invalid native route".into()))?;
+    Ok(PreparedNativeFocusedMessage {
+        message_id: header.message_id,
+        sealed_record,
+        signed_intent,
+    })
+}
+
+fn sign_native_routing_declaration(
+    chain_instance_id: [u8; 32],
+    room_id: [u8; 32],
+    target_handle: &[u8],
+    signed_intent: &[u8],
+    signing_seed: &[u8; 32],
+) -> Result<Vec<u8>, ClientError> {
+    let preimage = cowchat_core::native_route::native_room_intent_signing_preimage_v1(
+        chain_instance_id,
+        room_id,
+        target_handle,
+        signed_intent,
+    )
+    .ok_or_else(|| ClientError::Encryption("invalid native Routing declaration".into()))?;
+    let signature = SigningKey::from_bytes(signing_seed)
+        .sign(&preimage)
+        .to_bytes();
+    cowchat_core::native_route::native_room_intent_wire_bytes_v1(
+        chain_instance_id,
+        room_id,
+        target_handle,
+        signed_intent,
+        signature,
+    )
+    .ok_or_else(|| ClientError::Encryption("invalid native Routing declaration".into()))
+}
+
+/// Seal hosted and native views from one plaintext. Persist the returned
+/// payload for exact retry. The server authenticates the native bytes but
+/// cannot decrypt either view, so the client constructs both together.
+pub fn prepare_hosted_native_focused_message(
+    hosted_key: &[u8; 32],
+    context: &cowchat_core::room_crypto::Context<'_>,
+    content: &str,
+    target_handle: &str,
+    native: NativeFocusedMaterial<'_>,
+    reply_to: Option<&str>,
+) -> Result<SendMessagePayload, ClientError> {
+    if context.message_id != hex::encode(native.header.message_id)
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v2(
+            &native.header.message_id,
+            native.paired_salt,
+            content.as_bytes(),
+        )
+        || target_handle.is_empty()
+        || target_handle.starts_with('@')
+        || reply_to != native.header.reply_to.map(hex::encode).as_deref()
+    {
+        return Err(ClientError::Encryption(
+            "hosted and native focused identities or reply targets do not match".into(),
+        ));
+    }
+    let native_body =
+        cowchat_crypto::paired_message_id::paired_body_v2(native.paired_salt, content.as_bytes());
+    let prepared = prepare_native_focused_message(
+        native.header,
+        native.generation_secret,
+        &native_body,
+        native.signing_seed,
+        native.expected_record_signing_key,
+        native.claim_generation,
+    )?;
+    let native_routing_intent = sign_native_routing_declaration(
+        native.chain_instance_id,
+        native.header.room_id,
+        target_handle.as_bytes(),
+        &prepared.signed_intent,
+        native.signing_seed,
+    )?;
+    let content =
+        cowchat_core::room_crypto::encrypt_paired(hosted_key, context, content, native.paired_salt)
+            .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut payload = SendMessagePayload {
+        message_id: Some(context.message_id.into()),
+        room_id: context.room_id.into(),
+        key_epoch: Some(context.key_epoch.to_string()),
+        content,
+        reply_to: reply_to.map(String::from),
+        mentions: Vec::new(),
+        metadata: serde_json::json!({}),
+        native_focused: None,
+        native_room_wide: None,
+    };
+    payload.native_focused = Some(NativeFocusedSend {
+        target_handle: target_handle.into(),
+        sealed_record_hex: hex::encode(prepared.sealed_record),
+        signed_intent_hex: hex::encode(prepared.signed_intent),
+        native_routing_intent_hex: hex::encode(native_routing_intent),
+    });
+    Ok(payload)
+}
+
+/// Prepare both encrypted room views for a room-wide human message. The
+/// returned bytes are one retry unit and must be persisted before submission.
+pub fn prepare_hosted_native_room_wide_message(
+    hosted_key: &[u8; 32],
+    context: &cowchat_core::room_crypto::Context<'_>,
+    content: &str,
+    native: NativeRoomWideMaterial<'_>,
+    reply_to: Option<&str>,
+) -> Result<SendMessagePayload, ClientError> {
+    if context.message_id != hex::encode(native.header.message_id)
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v2(
+            &native.header.message_id,
+            native.paired_salt,
+            content.as_bytes(),
+        )
+        || reply_to != native.header.reply_to.map(hex::encode).as_deref()
+    {
+        return Err(ClientError::Encryption(
+            "hosted and native room-wide identities or reply targets do not match".into(),
+        ));
+    }
+    let native_body =
+        cowchat_crypto::paired_message_id::paired_body_v2(native.paired_salt, content.as_bytes());
+    let prepared = prepare_native_room_wide_message(
+        native.header,
+        native.generation_secret,
+        &native_body,
+        native.signing_seed,
+        native.expected_record_signing_key,
+    )?;
+    let native_routing_intent = sign_native_routing_declaration(
+        native.chain_instance_id,
+        native.header.room_id,
+        b"",
+        &prepared.signed_intent,
+        native.signing_seed,
+    )?;
+    let content =
+        cowchat_core::room_crypto::encrypt_paired(hosted_key, context, content, native.paired_salt)
+            .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut payload = SendMessagePayload {
+        message_id: Some(context.message_id.into()),
+        room_id: context.room_id.into(),
+        key_epoch: Some(context.key_epoch.to_string()),
+        content,
+        reply_to: reply_to.map(String::from),
+        mentions: Vec::new(),
+        metadata: serde_json::json!({}),
+        native_focused: None,
+        native_room_wide: None,
+    };
+    payload.native_room_wide = Some(NativeRoomWideSend {
+        sealed_record_hex: hex::encode(prepared.sealed_record),
+        signed_intent_hex: hex::encode(prepared.signed_intent),
+        native_routing_intent_hex: hex::encode(native_routing_intent),
+    });
+    Ok(payload)
+}
 
 async fn read_frame_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -33,9 +314,330 @@ async fn read_frame_line<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowchat_crypto::native_actor::{
+        open_room_wide_source_seat_record_v1, open_source_seat_record_v1,
+        ExpectedRoomWideSourceSeatRecordV1, ExpectedSourceSeatRecordV1, HumanFocusedHeaderV1,
+        HumanRoomWideHeaderV1, SourceSeatKindV1,
+    };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn focused_native_prepare_binds_exact_sealed_record_and_target() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x32; 32],
+            seat_id: [0x33; 32],
+            key_binding_commitment: [0x34; 32],
+            key_generation: 2,
+            message_id: [0x35; 32],
+            target_seat_id: [0x36; 32],
+            reply_to: None,
+        };
+        let secret = [0x37; 32];
+        let prepared = prepare_native_focused_message(
+            &header,
+            &secret,
+            b"forecast",
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+            1,
+        )
+        .unwrap();
+        let opened = open_source_seat_record_v1(
+            &prepared.sealed_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"forecast");
+        assert_eq!(opened.paired_salt, None);
+        assert_eq!(prepared.signed_intent.len(), 234);
+        let commitment = Sha256::digest(&prepared.sealed_record);
+        assert_eq!(&prepared.signed_intent[129..161], commitment.as_slice());
+        assert_eq!(&prepared.signed_intent[65..97], &header.target_seat_id);
+    }
+
+    #[test]
+    fn room_wide_native_prepare_signs_untargeted_sealed_record() {
+        let key = SigningKey::from_bytes(&[0x61; 32]);
+        let header = HumanRoomWideHeaderV1 {
+            chain_id: 7,
+            room_id: [0x62; 32],
+            seat_id: [0x63; 32],
+            key_binding_commitment: [0x64; 32],
+            key_generation: 2,
+            message_id: [0x65; 32],
+            reply_to: None,
+        };
+        let secret = [0x66; 32];
+        let prepared = prepare_native_room_wide_message(
+            &header,
+            &secret,
+            b"ordinary room message",
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(prepared.signed_intent.len(), 234);
+        assert_eq!(&prepared.signed_intent[65..97], &[0; 32]);
+        assert_eq!(&prepared.signed_intent[161..169], &[0; 8]);
+        assert_eq!(prepared.signed_intent[169], 1);
+        assert_eq!(
+            &prepared.signed_intent[129..161],
+            Sha256::digest(&prepared.sealed_record).as_slice()
+        );
+        let opened = open_room_wide_source_seat_record_v1(
+            &prepared.sealed_record,
+            &ExpectedRoomWideSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+            },
+            &key.verifying_key().to_bytes(),
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"ordinary room message");
+    }
+
+    #[test]
+    fn hosted_room_wide_prepare_retains_both_encrypted_views() {
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let paired_id = cowchat_crypto::paired_message_id::paired_message_id_v2(
+            &[0x75; 32],
+            b"ordinary room message",
+        );
+        let header = HumanRoomWideHeaderV1 {
+            chain_id: 7,
+            room_id: [0x72; 32],
+            seat_id: [0x73; 32],
+            key_binding_commitment: [0x74; 32],
+            key_generation: 2,
+            message_id: paired_id,
+            reply_to: None,
+        };
+        let message_id = hex::encode(header.message_id);
+        let context = cowchat_core::room_crypto::Context {
+            room_id: "hosted-room",
+            key_epoch: 2,
+            message_id: &message_id,
+        };
+        let hosted_key = [0x76; 32];
+        let native_secret = [0x77; 32];
+        let payload = prepare_hosted_native_room_wide_message(
+            &hosted_key,
+            &context,
+            "ordinary room message",
+            NativeRoomWideMaterial {
+                chain_instance_id: [0x79; 32],
+                header: &header,
+                generation_secret: &native_secret,
+                paired_salt: &[0x75; 32],
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(payload.native_focused.is_none());
+        assert_eq!(
+            cowchat_core::room_crypto::decrypt(&hosted_key, &context, &payload.content).unwrap(),
+            "ordinary room message"
+        );
+        let persisted = serde_json::to_vec(&payload).unwrap();
+        let retry: SendMessagePayload = serde_json::from_slice(&persisted).unwrap();
+        let native = retry.native_room_wide.unwrap();
+        let declaration = hex::decode(&native.native_routing_intent_hex).unwrap();
+        assert_eq!(
+            &declaration[..8],
+            cowchat_core::native_route::NATIVE_INTENT_MAGIC_V1
+        );
+        assert_eq!(&declaration[9..41], &[0x79; 32]);
+        assert_eq!(&declaration[41..73], &header.room_id);
+        assert_eq!(declaration[73], 0);
+        let sealed = hex::decode(native.sealed_record_hex).unwrap();
+        let opened = open_room_wide_source_seat_record_v1(
+            &sealed,
+            &ExpectedRoomWideSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"ordinary room message");
+        assert_eq!(opened.paired_salt, Some([0x75; 32]));
+        assert!(cowchat_core::room_crypto::encrypt_paired(
+            &hosted_key,
+            &context,
+            "other text",
+            &[0x75; 32]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn focused_hosted_prepare_seals_both_views_from_one_plaintext() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let paired_id =
+            cowchat_crypto::paired_message_id::paired_message_id_v2(&[0x35; 32], b"forecast");
+        let header = HumanFocusedHeaderV1 {
+            chain_id: 7,
+            room_id: [0x32; 32],
+            seat_id: [0x33; 32],
+            key_binding_commitment: [0x34; 32],
+            key_generation: 2,
+            message_id: paired_id,
+            target_seat_id: [0x36; 32],
+            reply_to: None,
+        };
+        let message_id = hex::encode(header.message_id);
+        let context = cowchat_core::room_crypto::Context {
+            room_id: "hosted-room",
+            key_epoch: 2,
+            message_id: &message_id,
+        };
+        let hosted_key = [0x38; 32];
+        let native_secret = [0x37; 32];
+        let payload = prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
+                header: &header,
+                generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cowchat_core::room_crypto::decrypt(&hosted_key, &context, &payload.content).unwrap(),
+            "forecast"
+        );
+        // A persisted public send contains ciphertext and the digest only.
+        let public = serde_json::to_string(&payload).unwrap();
+        assert!(!public.contains(&hex::encode([0x35; 32])));
+        assert!(!public.contains("forecast"));
+        let focused = payload.native_focused.unwrap();
+        assert_eq!(focused.target_handle, "financial_planner");
+        let declaration = hex::decode(&focused.native_routing_intent_hex).unwrap();
+        assert_eq!(
+            &declaration[..8],
+            cowchat_core::native_route::NATIVE_INTENT_MAGIC_V1
+        );
+        assert_eq!(&declaration[9..41], &[0x39; 32]);
+        assert_eq!(&declaration[41..73], &header.room_id);
+        assert_eq!(declaration[73], b"financial_planner".len() as u8);
+        assert_eq!(&declaration[74..91], b"financial_planner");
+        let native_record = hex::decode(focused.sealed_record_hex).unwrap();
+        assert!(!native_record.windows(32).any(|window| window == [0x35; 32]));
+        let opened = open_source_seat_record_v1(
+            &native_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"forecast");
+        assert_eq!(opened.paired_salt, Some([0x35; 32]));
+        let divergent = prepare_native_focused_message(
+            &header,
+            &native_secret,
+            &cowchat_crypto::paired_message_id::paired_body_v2(&[0x35; 32], b"other text"),
+            &key.to_bytes(),
+            &key.verifying_key().to_bytes(),
+            1,
+        )
+        .unwrap();
+        assert!(open_source_seat_record_v1(
+            &divergent.sealed_record,
+            &ExpectedSourceSeatRecordV1 {
+                chain_id: header.chain_id,
+                room_id: header.room_id,
+                source_seat_id: header.seat_id,
+                source_seat_kind: SourceSeatKindV1::Human,
+                source_key_binding_commitment: header.key_binding_commitment,
+                key_generation: header.key_generation,
+                target_seat_id: header.target_seat_id,
+            },
+            &key.verifying_key().to_bytes(),
+            &native_secret,
+        )
+        .is_err());
+        let different_reply = hex::encode([0x39; 32]);
+        assert!(prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
+                header: &header,
+                generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
+            Some(&different_reply),
+        )
+        .is_err());
+        let header_with_reply = HumanFocusedHeaderV1 {
+            reply_to: Some([0x39; 32]),
+            ..header
+        };
+        assert!(prepare_hosted_native_focused_message(
+            &hosted_key,
+            &context,
+            "forecast",
+            "financial_planner",
+            NativeFocusedMaterial {
+                chain_instance_id: [0x39; 32],
+                header: &header_with_reply,
+                generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
+                signing_seed: &key.to_bytes(),
+                expected_record_signing_key: &key.verifying_key().to_bytes(),
+                claim_generation: 1,
+            },
+            Some(&different_reply),
+        )
+        .is_ok());
+    }
 
     #[tokio::test]
     async fn client_answers_server_heartbeat_ping() {
@@ -262,6 +864,8 @@ mod tests {
 pub enum ClientError {
     #[error("room encryption: {0}")]
     Encryption(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -686,6 +1290,45 @@ impl CowchatClient {
         )
     }
 
+    /// Prepare a focused send using the verified hosted key already opened by
+    /// this member session. The caller must save the returned bytes before
+    /// submission so an uncertain response can be retried exactly.
+    pub fn prepare_cached_hosted_native_focused_message(
+        &self,
+        context: &cowchat_core::room_crypto::Context<'_>,
+        content: &str,
+        target_handle: &str,
+        native: NativeFocusedMaterial<'_>,
+        reply_to: Option<&str>,
+    ) -> Result<SendMessagePayload, ClientError> {
+        prepare_hosted_native_focused_message(
+            self.hosted_key(context.room_id, context.key_epoch)?,
+            context,
+            content,
+            target_handle,
+            native,
+            reply_to,
+        )
+    }
+
+    /// Prepare a room-wide send with the verified hosted key already opened
+    /// by this member session. Save the returned payload before submitting it.
+    pub fn prepare_cached_hosted_native_room_wide_message(
+        &self,
+        context: &cowchat_core::room_crypto::Context<'_>,
+        content: &str,
+        native: NativeRoomWideMaterial<'_>,
+        reply_to: Option<&str>,
+    ) -> Result<SendMessagePayload, ClientError> {
+        prepare_hosted_native_room_wide_message(
+            self.hosted_key(context.room_id, context.key_epoch)?,
+            context,
+            content,
+            native,
+            reply_to,
+        )
+    }
+
     pub(crate) fn hosted_key(
         &self,
         room_id: &str,
@@ -980,6 +1623,8 @@ impl CowchatClient {
             reply_to: reply_to.map(String::from),
             metadata,
             mentions,
+            native_focused: None,
+            native_room_wide: None,
         }
     }
 
@@ -1004,6 +1649,8 @@ impl CowchatClient {
             reply_to: reply_to.map(String::from),
             mentions,
             metadata,
+            native_focused: None,
+            native_room_wide: None,
         })
     }
 
@@ -1133,6 +1780,235 @@ impl CowchatClient {
             .request(FrameType::RoomInfo, serde_json::json!({"room_id": room_id}))
             .await?;
         Ok(resp.payload)
+    }
+
+    /// Enroll one finalized native actor seat under a hosted room. Retain the
+    /// command ID and proof bytes when retrying an uncertain result.
+    pub async fn enroll_native_actor_seat(
+        &self,
+        payload: &EnrollNativeActorSeatPayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::EnrollNativeActorSeat,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Commit a jointly signed owner-log locator after refreshing the exact
+    /// native room and seat proof. Keep this payload for exact retry.
+    pub async fn bind_owner_log(&self, payload: &BindOwnerLogPayload) -> Result<(), ClientError> {
+        self.request(FrameType::BindOwnerLog, serde_json::to_value(payload)?)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn owner_log_binding_context(
+        &self,
+        payload: &GetOwnerLogBindingContextPayload,
+    ) -> Result<OwnerLogBindingContext, ClientError> {
+        let response = self
+            .request(
+                FrameType::GetOwnerLogBindingContext,
+                serde_json::to_value(payload)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    /// Enroll this authenticated member's native source seat in a hosted room.
+    pub async fn enroll_native_source_seat(
+        &self,
+        payload: &EnrollNativeSourceSeatPayload,
+    ) -> Result<NativeSourceEnrollment, ClientError> {
+        let response = self
+            .request(
+                FrameType::EnrollNativeSourceSeat,
+                serde_json::to_value(payload)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    /// Submit a prepared, actor-signed claim. Retain the exact command ID and
+    /// signature when retrying an uncertain result.
+    pub async fn claim_actor_handle(
+        &self,
+        payload: &ClaimActorHandlePayload,
+    ) -> Result<ResolvedActorHandle, ClientError> {
+        let response = self
+            .request(FrameType::ClaimActorHandle, serde_json::to_value(payload)?)
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    pub fn prepare_actor_handle_claim(
+        room_id: &str,
+        handle: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        signing_key: &SigningKey,
+    ) -> ClaimActorHandlePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::claim_preimage(
+            room_id,
+            &command_id,
+            handle,
+            agent_id,
+            &seat_id,
+            generation,
+        );
+        ClaimActorHandlePayload {
+            room_id: room_id.into(),
+            command_id,
+            handle: handle.into(),
+            seat_id,
+            signing_key: signing_key.verifying_key().to_bytes(),
+            generation,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
+        }
+    }
+
+    pub async fn release_actor_handle(
+        &self,
+        payload: &ReleaseActorHandlePayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::ReleaseActorHandle,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn recover_actor_handle(
+        &self,
+        payload: &RecoverActorHandlePayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::RecoverActorHandle,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn prepare_actor_handle_release(
+        room_id: &str,
+        handle: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        signing_key: &SigningKey,
+    ) -> ReleaseActorHandlePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::release_preimage(
+            room_id,
+            &command_id,
+            handle,
+            agent_id,
+            &seat_id,
+            generation,
+        );
+        ReleaseActorHandlePayload {
+            room_id: room_id.into(),
+            command_id,
+            handle: handle.into(),
+            seat_id,
+            generation,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
+        }
+    }
+
+    pub async fn set_actor_wake_mode(
+        &self,
+        payload: &SetActorWakeModePayload,
+    ) -> Result<ActorWakeMode, ClientError> {
+        let response = self
+            .request(FrameType::SetActorWakeMode, serde_json::to_value(payload)?)
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    pub fn prepare_actor_wake_mode(
+        room_id: &str,
+        handle: &str,
+        agent_id: &str,
+        seat_id: [u8; 32],
+        generation: u64,
+        mode: ActorWakeMode,
+        signing_key: &SigningKey,
+    ) -> SetActorWakeModePayload {
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let preimage = cowchat_core::actor_directory::wake_mode_preimage(
+            room_id,
+            &command_id,
+            handle,
+            agent_id,
+            &seat_id,
+            generation,
+            mode,
+        );
+        SetActorWakeModePayload {
+            room_id: room_id.into(),
+            command_id,
+            handle: handle.into(),
+            seat_id,
+            generation,
+            mode,
+            signature: hex::encode(signing_key.sign(&preimage).to_bytes()),
+            native_control_hex: String::new(),
+        }
+    }
+
+    pub async fn resolve_actor_handle(
+        &self,
+        room_id: &str,
+        handle: &str,
+    ) -> Result<ResolvedActorHandle, ClientError> {
+        let response = self
+            .request(
+                FrameType::ResolveActorHandle,
+                serde_json::to_value(ResolveActorHandlePayload {
+                    room_id: room_id.into(),
+                    handle: handle.into(),
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
+    }
+
+    pub async fn provision_native_append_grant(
+        &self,
+        payload: &ProvisionNativeAppendGrantPayload,
+    ) -> Result<(), ClientError> {
+        self.request(
+            FrameType::ProvisionNativeAppendGrant,
+            serde_json::to_value(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn native_route_status(
+        &self,
+        room_id: &str,
+        message_id: &str,
+    ) -> Result<NativeRouteStatus, ClientError> {
+        let response = self
+            .request(
+                FrameType::GetNativeRouteStatus,
+                serde_json::to_value(GetNativeRouteStatusPayload {
+                    room_id: room_id.into(),
+                    message_id: message_id.into(),
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(response.payload)?)
     }
 
     /// Convenience: return the agent_id currently holding the turn token in `room_id`,
@@ -1577,6 +2453,8 @@ impl CowchatClient {
             reply_to: Some(work.message_id.clone()),
             metadata: serde_json::json!({}),
             mentions,
+            native_focused: None,
+            native_room_wide: None,
         })
     }
 
@@ -1584,12 +2462,38 @@ impl CowchatClient {
         &self,
         payload: &SendMessagePayload,
     ) -> Result<ChatMessage, ClientError> {
+        Ok(self
+            .append_prepared_message_with_status(payload)
+            .await?
+            .message)
+    }
+
+    /// A focused native send reports `CommittedRoutingPending` until an inbox
+    /// receipt exists. The response does not claim the actor has been woken.
+    pub async fn append_prepared_message_with_status(
+        &self,
+        payload: &SendMessagePayload,
+    ) -> Result<PreparedSendResult, ClientError> {
         let response = self
             .request(FrameType::SendMessage, serde_json::to_value(payload)?)
             .await?;
+        let delivery_status = response
+            .payload
+            .get("delivery_status")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        if payload.native_focused.is_some() && delivery_status.is_none() {
+            return Err(ClientError::Protocol(
+                "focused send response omitted routing status".into(),
+            ));
+        }
         let mut message: ChatMessage = serde_json::from_value(response.payload)?;
         self.decrypt_message(&mut message);
-        Ok(message)
+        Ok(PreparedSendResult {
+            message,
+            delivery_status,
+        })
     }
 
     // --- Webhook subscriptions ---
