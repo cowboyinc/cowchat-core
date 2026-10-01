@@ -67,6 +67,7 @@ pub struct NativeFocusedMaterial<'a> {
     pub chain_instance_id: [u8; 32],
     pub header: &'a cowchat_crypto::native_actor::HumanFocusedHeaderV1,
     pub generation_secret: &'a [u8; 32],
+    pub paired_salt: &'a [u8; 32],
     pub signing_seed: &'a [u8; 32],
     pub expected_record_signing_key: &'a [u8; 32],
     pub claim_generation: u64,
@@ -76,6 +77,7 @@ pub struct NativeRoomWideMaterial<'a> {
     pub chain_instance_id: [u8; 32],
     pub header: &'a cowchat_crypto::native_actor::HumanRoomWideHeaderV1,
     pub generation_secret: &'a [u8; 32],
+    pub paired_salt: &'a [u8; 32],
     pub signing_seed: &'a [u8; 32],
     pub expected_record_signing_key: &'a [u8; 32],
 }
@@ -175,8 +177,9 @@ pub fn prepare_hosted_native_focused_message(
     reply_to: Option<&str>,
 ) -> Result<SendMessagePayload, ClientError> {
     if context.message_id != hex::encode(native.header.message_id)
-        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v2(
             &native.header.message_id,
+            native.paired_salt,
             content.as_bytes(),
         )
         || target_handle.is_empty()
@@ -187,10 +190,12 @@ pub fn prepare_hosted_native_focused_message(
             "hosted and native focused identities or reply targets do not match".into(),
         ));
     }
+    let native_body =
+        cowchat_crypto::paired_message_id::paired_body_v2(native.paired_salt, content.as_bytes());
     let prepared = prepare_native_focused_message(
         native.header,
         native.generation_secret,
-        content.as_bytes(),
+        &native_body,
         native.signing_seed,
         native.expected_record_signing_key,
         native.claim_generation,
@@ -202,14 +207,20 @@ pub fn prepare_hosted_native_focused_message(
         &prepared.signed_intent,
         native.signing_seed,
     )?;
-    let mut payload = CowchatClient::prepare_room_key_message(
-        hosted_key,
-        context,
+    let content =
+        cowchat_core::room_crypto::encrypt_paired(hosted_key, context, content, native.paired_salt)
+            .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut payload = SendMessagePayload {
+        message_id: Some(context.message_id.into()),
+        room_id: context.room_id.into(),
+        key_epoch: Some(context.key_epoch.to_string()),
         content,
-        reply_to,
-        Vec::new(),
-        serde_json::json!({}),
-    )?;
+        reply_to: reply_to.map(String::from),
+        mentions: Vec::new(),
+        metadata: serde_json::json!({}),
+        native_focused: None,
+        native_room_wide: None,
+    };
     payload.native_focused = Some(NativeFocusedSend {
         target_handle: target_handle.into(),
         sealed_record_hex: hex::encode(prepared.sealed_record),
@@ -229,8 +240,9 @@ pub fn prepare_hosted_native_room_wide_message(
     reply_to: Option<&str>,
 ) -> Result<SendMessagePayload, ClientError> {
     if context.message_id != hex::encode(native.header.message_id)
-        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
+        || !cowchat_crypto::paired_message_id::verify_paired_message_id_v2(
             &native.header.message_id,
+            native.paired_salt,
             content.as_bytes(),
         )
         || reply_to != native.header.reply_to.map(hex::encode).as_deref()
@@ -239,10 +251,12 @@ pub fn prepare_hosted_native_room_wide_message(
             "hosted and native room-wide identities or reply targets do not match".into(),
         ));
     }
+    let native_body =
+        cowchat_crypto::paired_message_id::paired_body_v2(native.paired_salt, content.as_bytes());
     let prepared = prepare_native_room_wide_message(
         native.header,
         native.generation_secret,
-        content.as_bytes(),
+        &native_body,
         native.signing_seed,
         native.expected_record_signing_key,
     )?;
@@ -253,14 +267,20 @@ pub fn prepare_hosted_native_room_wide_message(
         &prepared.signed_intent,
         native.signing_seed,
     )?;
-    let mut payload = CowchatClient::prepare_room_key_message(
-        hosted_key,
-        context,
+    let content =
+        cowchat_core::room_crypto::encrypt_paired(hosted_key, context, content, native.paired_salt)
+            .map_err(|error| ClientError::Encryption(error.to_string()))?;
+    let mut payload = SendMessagePayload {
+        message_id: Some(context.message_id.into()),
+        room_id: context.room_id.into(),
+        key_epoch: Some(context.key_epoch.to_string()),
         content,
-        reply_to,
-        Vec::new(),
-        serde_json::json!({}),
-    )?;
+        reply_to: reply_to.map(String::from),
+        mentions: Vec::new(),
+        metadata: serde_json::json!({}),
+        native_focused: None,
+        native_room_wide: None,
+    };
     payload.native_room_wide = Some(NativeRoomWideSend {
         sealed_record_hex: hex::encode(prepared.sealed_record),
         signed_intent_hex: hex::encode(prepared.signed_intent),
@@ -342,6 +362,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"forecast");
+        assert_eq!(opened.paired_salt, None);
         assert_eq!(prepared.signed_intent.len(), 234);
         let commitment = Sha256::digest(&prepared.sealed_record);
         assert_eq!(&prepared.signed_intent[129..161], commitment.as_slice());
@@ -397,8 +418,8 @@ mod tests {
     #[test]
     fn hosted_room_wide_prepare_retains_both_encrypted_views() {
         let key = SigningKey::from_bytes(&[0x71; 32]);
-        let paired_id = cowchat_crypto::paired_message_id::paired_message_id_v1(
-            [0x75; 12],
+        let paired_id = cowchat_crypto::paired_message_id::paired_message_id_v2(
+            &[0x75; 32],
             b"ordinary room message",
         );
         let header = HumanRoomWideHeaderV1 {
@@ -426,6 +447,7 @@ mod tests {
                 chain_instance_id: [0x79; 32],
                 header: &header,
                 generation_secret: &native_secret,
+                paired_salt: &[0x75; 32],
                 signing_seed: &key.to_bytes(),
                 expected_record_signing_key: &key.verifying_key().to_bytes(),
             },
@@ -464,16 +486,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"ordinary room message");
-        let divergent =
-            cowchat_core::room_crypto::encrypt(&hosted_key, &context, "other text").unwrap();
-        assert!(cowchat_core::room_crypto::decrypt(&hosted_key, &context, &divergent).is_err());
+        assert_eq!(opened.paired_salt, Some([0x75; 32]));
+        assert!(cowchat_core::room_crypto::encrypt_paired(
+            &hosted_key,
+            &context,
+            "other text",
+            &[0x75; 32]
+        )
+        .is_err());
     }
 
     #[test]
     fn focused_hosted_prepare_seals_both_views_from_one_plaintext() {
         let key = SigningKey::from_bytes(&[0x31; 32]);
         let paired_id =
-            cowchat_crypto::paired_message_id::paired_message_id_v1([0x35; 12], b"forecast");
+            cowchat_crypto::paired_message_id::paired_message_id_v2(&[0x35; 32], b"forecast");
         let header = HumanFocusedHeaderV1 {
             chain_id: 7,
             room_id: [0x32; 32],
@@ -501,6 +528,7 @@ mod tests {
                 chain_instance_id: [0x39; 32],
                 header: &header,
                 generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
                 signing_seed: &key.to_bytes(),
                 expected_record_signing_key: &key.verifying_key().to_bytes(),
                 claim_generation: 1,
@@ -512,6 +540,10 @@ mod tests {
             cowchat_core::room_crypto::decrypt(&hosted_key, &context, &payload.content).unwrap(),
             "forecast"
         );
+        // A persisted public send contains ciphertext and the digest only.
+        let public = serde_json::to_string(&payload).unwrap();
+        assert!(!public.contains(&hex::encode([0x35; 32])));
+        assert!(!public.contains("forecast"));
         let focused = payload.native_focused.unwrap();
         assert_eq!(focused.target_handle, "financial_planner");
         let declaration = hex::decode(&focused.native_routing_intent_hex).unwrap();
@@ -524,6 +556,7 @@ mod tests {
         assert_eq!(declaration[73], b"financial_planner".len() as u8);
         assert_eq!(&declaration[74..91], b"financial_planner");
         let native_record = hex::decode(focused.sealed_record_hex).unwrap();
+        assert!(!native_record.windows(32).any(|window| window == [0x35; 32]));
         let opened = open_source_seat_record_v1(
             &native_record,
             &ExpectedSourceSeatRecordV1 {
@@ -540,10 +573,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened.plaintext, b"forecast");
+        assert_eq!(opened.paired_salt, Some([0x35; 32]));
         let divergent = prepare_native_focused_message(
             &header,
             &native_secret,
-            b"other text",
+            &cowchat_crypto::paired_message_id::paired_body_v2(&[0x35; 32], b"other text"),
             &key.to_bytes(),
             &key.verifying_key().to_bytes(),
             1,
@@ -574,6 +608,7 @@ mod tests {
                 chain_instance_id: [0x39; 32],
                 header: &header,
                 generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
                 signing_seed: &key.to_bytes(),
                 expected_record_signing_key: &key.verifying_key().to_bytes(),
                 claim_generation: 1,
@@ -594,6 +629,7 @@ mod tests {
                 chain_instance_id: [0x39; 32],
                 header: &header_with_reply,
                 generation_secret: &native_secret,
+                paired_salt: &[0x35; 32],
                 signing_seed: &key.to_bytes(),
                 expected_record_signing_key: &key.verifying_key().to_bytes(),
                 claim_generation: 1,

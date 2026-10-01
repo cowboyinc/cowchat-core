@@ -78,6 +78,8 @@ pub struct OpenedSourceSeatRecordV1 {
     pub reply_to: Option<[u8; 32]>,
     pub mentions: Vec<[u8; 32]>,
     pub plaintext: Vec<u8>,
+    /// Available only after decryption and commitment verification.
+    pub paired_salt: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -514,17 +516,26 @@ pub fn open_room_wide_source_seat_record_v1(
         &sealed.signature,
         generation_secret,
     )?;
-    if crate::paired_message_id::is_paired_message_id_v1(&header.message_id)
-        && !crate::paired_message_id::verify_paired_message_id_v1(&header.message_id, &plaintext)
-    {
-        return Err(Error::Decrypt);
-    }
+    let (paired_salt, plaintext) = open_source_body(&header.message_id, plaintext)?;
     Ok(OpenedSourceSeatRecordV1 {
         message_id: header.message_id,
         reply_to: header.reply_to,
         mentions: header.mentions,
         plaintext,
+        paired_salt,
     })
+}
+
+fn open_source_body(message_id: &[u8; 32], body: Vec<u8>) -> Result<(Option<[u8; 32]>, Vec<u8>)> {
+    if crate::paired_message_id::is_paired_message_id_v2(message_id) {
+        let (salt, plaintext) = crate::paired_message_id::open_paired_body_v2(message_id, &body)
+            .ok_or(Error::Decrypt)?;
+        Ok((Some(salt), plaintext.to_vec()))
+    } else if message_id.starts_with(b"cwp1") {
+        Err(Error::Decrypt)
+    } else {
+        Ok((None, body))
+    }
 }
 
 /// Verify the source seat signature, principal-kind role and every
@@ -555,16 +566,13 @@ pub fn open_source_seat_record_v1(
         &sealed.signature,
         generation_secret,
     )?;
-    if crate::paired_message_id::is_paired_message_id_v1(&checked.message_id)
-        && !crate::paired_message_id::verify_paired_message_id_v1(&checked.message_id, &plaintext)
-    {
-        return Err(Error::Decrypt);
-    }
+    let (paired_salt, plaintext) = open_source_body(&checked.message_id, plaintext)?;
     Ok(OpenedSourceSeatRecordV1 {
         message_id: checked.message_id,
         reply_to: checked.reply_to,
         mentions: checked.mentions,
         plaintext,
+        paired_salt,
     })
 }
 

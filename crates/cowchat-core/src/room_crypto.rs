@@ -6,6 +6,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine as _;
 use chacha20poly1305::aead::{rand_core::RngCore, Aead, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use cowchat_crypto::paired_message_id::{is_paired_message_id_v2, verify_paired_message_id_v2};
 
 const DOMAIN: &str = "cowchat-room-message-v1";
 
@@ -29,33 +30,71 @@ pub struct Context<'a> {
 
 impl Context<'_> {
     fn validate(&self) -> Result<(), Error> {
-        if self.room_id.is_empty() || self.message_id.is_empty() {
+        if self.room_id.is_empty()
+            || self.message_id.is_empty()
+            || self
+                .message_id_bytes()
+                .is_some_and(|id| id.starts_with(b"cwp1"))
+        {
             return Err(Error::Context);
         }
         Ok(())
+    }
+
+    fn message_id_bytes(&self) -> Option<[u8; 32]> {
+        hex::decode(self.message_id).ok()?.try_into().ok()
     }
 }
 
 /// Persist the result before send; uncertain retries must reuse these exact bytes.
 pub fn encrypt(key: &[u8; 32], context: &Context<'_>, text: &str) -> Result<String, Error> {
     context.validate()?;
+    if context
+        .message_id_bytes()
+        .is_some_and(|id| is_paired_message_id_v2(&id))
+    {
+        return Err(Error::Context);
+    }
     let mut nonce = [0u8; 12];
     OsRng
         .try_fill_bytes(&mut nonce)
         .map_err(|_| Error::Random)?;
-    encrypt_with_nonce(key, context, text, &nonce)
+    encrypt_with_nonce(key, context, text, None, &nonce)
+}
+
+/// The salt is encrypted with the text, never included in public metadata.
+pub fn encrypt_paired(
+    key: &[u8; 32],
+    context: &Context<'_>,
+    text: &str,
+    salt: &[u8; 32],
+) -> Result<String, Error> {
+    context.validate()?;
+    let id = context.message_id_bytes().ok_or(Error::Context)?;
+    if !verify_paired_message_id_v2(&id, salt, text.as_bytes()) {
+        return Err(Error::Context);
+    }
+    let mut nonce = [0u8; 12];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| Error::Random)?;
+    encrypt_with_nonce(key, context, text, Some(salt), &nonce)
 }
 
 fn encrypt_with_nonce(
     key: &[u8; 32],
     context: &Context<'_>,
     text: &str,
+    salt: Option<&[u8; 32]>,
     nonce: &[u8; 12],
 ) -> Result<String, Error> {
     let epoch = context.key_epoch.to_string();
-    let plaintext =
-        serde_json::to_vec(&[DOMAIN, context.room_id, &epoch, context.message_id, text])
-            .map_err(|_| Error::Encode)?;
+    let salt_hex = salt.map(hex::encode);
+    let mut fields = vec![DOMAIN, context.room_id, &epoch, context.message_id, text];
+    if let Some(salt) = &salt_hex {
+        fields.push(salt);
+    }
+    let plaintext = serde_json::to_vec(&fields).map_err(|_| Error::Encode)?;
     let ciphertext = ChaCha20Poly1305::new(key.into())
         .encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
         .map_err(|_| Error::Encode)?;
@@ -74,7 +113,11 @@ pub fn decrypt(key: &[u8; 32], context: &Context<'_>, content: &str) -> Result<S
     let plaintext = ChaCha20Poly1305::new(key.into())
         .decrypt(Nonce::from_slice(&bytes[..12]), &bytes[12..])
         .map_err(|_| Error::Decrypt)?;
-    let fields: [String; 5] = serde_json::from_slice(&plaintext).map_err(|_| Error::Decrypt)?;
+    let fields: Vec<String> = serde_json::from_slice(&plaintext).map_err(|_| Error::Decrypt)?;
+    let paired_id = context.message_id_bytes().filter(is_paired_message_id_v2);
+    if fields.len() != if paired_id.is_some() { 6 } else { 5 } {
+        return Err(Error::Decrypt);
+    }
     if fields[0] != DOMAIN
         || fields[1] != context.room_id
         || fields[2] != context.key_epoch.to_string()
@@ -82,16 +125,13 @@ pub fn decrypt(key: &[u8; 32], context: &Context<'_>, content: &str) -> Result<S
     {
         return Err(Error::Decrypt);
     }
-    if let Ok(id) = hex::decode(context.message_id) {
-        if let Ok(id) = <[u8; 32]>::try_from(id) {
-            if cowchat_crypto::paired_message_id::is_paired_message_id_v1(&id)
-                && !cowchat_crypto::paired_message_id::verify_paired_message_id_v1(
-                    &id,
-                    fields[4].as_bytes(),
-                )
-            {
-                return Err(Error::Decrypt);
-            }
+    if let Some(id) = paired_id {
+        let salt: [u8; 32] = hex::decode(&fields[5])
+            .map_err(|_| Error::Decrypt)?
+            .try_into()
+            .map_err(|_| Error::Decrypt)?;
+        if !verify_paired_message_id_v2(&id, &salt, fields[4].as_bytes()) {
+            return Err(Error::Decrypt);
         }
     }
     Ok(fields[4].clone())
@@ -122,7 +162,7 @@ mod tests {
             assert_eq!(decrypt(&key(), &context, wire).unwrap(), text);
             let nonce = std::array::from_fn(|i| i as u8);
             assert_eq!(
-                encrypt_with_nonce(&key(), &context, text, &nonce).unwrap(),
+                encrypt_with_nonce(&key(), &context, text, None, &nonce).unwrap(),
                 wire
             );
         }
@@ -183,6 +223,50 @@ mod tests {
             unicode_wire
         )
         .is_err());
+    }
+
+    #[test]
+    fn paired_body_requires_the_hidden_salt_and_matching_text() {
+        let salt = [7; 32];
+        let id = hex::encode(cowchat_crypto::paired_message_id::paired_message_id_v2(
+            &salt,
+            b"forecast",
+        ));
+        let context = Context {
+            room_id: "room-test",
+            key_epoch: 1,
+            message_id: &id,
+        };
+        let wire = encrypt_paired(&key(), &context, "forecast", &salt).unwrap();
+        assert_eq!(decrypt(&key(), &context, &wire).unwrap(), "forecast");
+        // Public sender helpers refuse unbound or divergent paired views.
+        assert!(encrypt(&key(), &context, "forecast").is_err());
+        assert!(encrypt_paired(&key(), &context, "other", &salt).is_err());
+        assert!(encrypt_paired(&key(), &context, "forecast", &[8; 32]).is_err());
+        // Even a sender who constructs authenticated ciphertext directly
+        // cannot pass the receiver with missing, changed or crossed salt/text.
+        for (text, salt) in [
+            ("forecast", None),
+            ("forecast", Some(&[8; 32])),
+            ("other", Some(&salt)),
+        ] {
+            let bad = encrypt_with_nonce(&key(), &context, text, salt, &[1; 12]).unwrap();
+            assert!(decrypt(&key(), &context, &bad).is_err());
+        }
+        let unpaired = Context {
+            message_id: "ordinary",
+            ..context
+        };
+        let extra =
+            encrypt_with_nonce(&key(), &unpaired, "forecast", Some(&salt), &[1; 12]).unwrap();
+        assert!(decrypt(&key(), &unpaired, &extra).is_err());
+        let old_id = id.replacen("63777032", "63777031", 1);
+        let old = Context {
+            message_id: &old_id,
+            ..context
+        };
+        assert!(encrypt(&key(), &old, "forecast").is_err());
+        assert!(decrypt(&key(), &old, &wire).is_err());
     }
 
     #[test]
