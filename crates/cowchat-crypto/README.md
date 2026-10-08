@@ -63,6 +63,32 @@ The 32-byte HPKE plaintext and CBSS value are the generation secret, not the
 already-derived AEAD key. Both feed the one `derive_room_key` implementation.
 `cowchat-core::crypto` re-exports it so existing `cow1` clients keep their bytes.
 
+## Chain-authorized Gateway ingress
+
+`native_actor` accepts three finalized source seat kinds. Human and Actor
+records require null `via` and `via_sender`. Gateway records require
+`role=external`, a signed `via` exactly equal to the trusted seat's
+`gateway_ref`, and a signed, nonempty external sender ID in `via_sender`.
+Both identifiers are at most 128 ASCII bytes using letters, digits and
+`._:/@+-`; for example `telegram:-10012345` and `87654321`. They identify a
+channel and a sender, not display names or wallet authority. The Gateway's
+signature authenticates its assertion about that sender; it does not prove
+that the external provider signed the message.
+
+Callers must obtain the Gateway reference and record key from the same
+finalized seat authority and enforce `ROOM_SCOPE_GATEWAY_INGRESS` along with
+APPEND/MENTION and the ordinary membership, generation and revocation checks.
+The crypto crate does not decide those chain permissions. A Gateway without
+its trusted reference is refused, and attaching that reference to a Human or
+Actor context is also refused. Authenticated/opened results carry optional
+Gateway attribution only after the signed source profile is checked.
+
+`seal_gateway_message_v1` uses the door's own record seed and the room key.
+An optional target produces a focused record; no target produces a room-wide
+record whose wake permission is determined independently by each actor's
+subscription. Existing direct Human/Actor wire bytes are unchanged. New Rust
+callers explicitly set `gateway_ref: None` for direct seats.
+
 ## Bounds and evidence
 
 Signed CBOR is capped at 64 KiB, depth 16, and 4096 total values. Length and
