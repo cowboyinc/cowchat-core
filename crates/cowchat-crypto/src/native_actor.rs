@@ -3,8 +3,9 @@
 //! The caller must obtain every expected field and the record-signing key from
 //! one finalized room-authority proof. Actor and human seats use the same
 //! signature boundary because chain seat admission has already verified their
-//! controller authorization. Gateway ingress requires a separate attribution
-//! profile and is refused here.
+//! controller authorization. Gateway ingress has an external-author profile:
+//! its channel reference must match finalized Gateway seat authority and its
+//! signed sender identifier remains an assertion by that door, never a Human seat.
 use crate::{canonical, envelope, fields::Fields, Error, Result};
 use ciborium::value::Value;
 use ed25519_dalek::SigningKey;
@@ -44,7 +45,7 @@ impl SourceSeatKindV1 {
         match self {
             Self::Actor => Ok("actor"),
             Self::Human => Ok("human"),
-            Self::Gateway => Err(Error::Scope),
+            Self::Gateway => Ok("external"),
         }
     }
 }
@@ -55,6 +56,8 @@ pub struct ExpectedSourceSeatRecordV1 {
     pub room_id: [u8; 32],
     pub source_seat_id: [u8; 32],
     pub source_seat_kind: SourceSeatKindV1,
+    /// Required only for Gateway seats, from the finalized seat gateway_ref.
+    pub gateway_ref: Option<String>,
     pub source_key_binding_commitment: [u8; 32],
     pub key_generation: u64,
     /// A routed actor message must authenticate the target mention in the
@@ -68,12 +71,15 @@ pub struct ExpectedRoomWideSourceSeatRecordV1 {
     pub room_id: [u8; 32],
     pub source_seat_id: [u8; 32],
     pub source_seat_kind: SourceSeatKindV1,
+    /// Required only for Gateway seats, from the finalized seat gateway_ref.
+    pub gateway_ref: Option<String>,
     pub source_key_binding_commitment: [u8; 32],
     pub key_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenedSourceSeatRecordV1 {
+    pub attribution: Option<GatewayAttributionV1>,
     pub message_id: [u8; 32],
     pub reply_to: Option<[u8; 32]>,
     pub mentions: Vec<[u8; 32]>,
@@ -84,9 +90,122 @@ pub struct OpenedSourceSeatRecordV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedSourceSeatHeaderV1 {
+    pub attribution: Option<GatewayAttributionV1>,
     pub message_id: [u8; 32],
     pub reply_to: Option<[u8; 32]>,
     pub mentions: Vec<[u8; 32]>,
+}
+
+/// External identities are authenticated assertions by a Gateway key. They
+/// confer no Human, owner, wallet or actor authority on the external sender.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayAttributionV1 {
+    pub gateway_ref: String,
+    pub sender_id: String,
+}
+
+/// One door-authored message, focused on one actor or posted room-wide.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayMessageHeaderV1 {
+    pub message: HumanRoomWideHeaderV1,
+    pub target_seat_id: Option<[u8; 32]>,
+    pub attribution: GatewayAttributionV1,
+}
+
+/// A channel/sender reference is an opaque, bounded identifier, not display
+/// text. Providers may use namespaced IDs such as telegram:-10012345.
+pub fn validate_gateway_identifier_v1(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
+    {
+        return Err(Error::Scope);
+    }
+    Ok(())
+}
+
+fn validate_source_profile(kind: SourceSeatKindV1, gateway_ref: Option<&str>) -> Result<()> {
+    match (kind, gateway_ref) {
+        (SourceSeatKindV1::Gateway, Some(reference)) => validate_gateway_identifier_v1(reference),
+        (SourceSeatKindV1::Actor | SourceSeatKindV1::Human, None) => Ok(()),
+        _ => Err(Error::Scope),
+    }
+}
+
+fn check_attribution(
+    fields: &Fields,
+    kind: SourceSeatKindV1,
+    gateway_ref: Option<&str>,
+) -> Result<Option<GatewayAttributionV1>> {
+    validate_source_profile(kind, gateway_ref)?;
+    let via = fields.nullable_text("via")?;
+    let sender = fields.nullable_text("via_sender")?;
+    match (gateway_ref, via, sender) {
+        (None, None, None) => Ok(None),
+        (Some(expected), Some(reference), Some(sender_id)) if reference == expected => {
+            validate_gateway_identifier_v1(&sender_id)?;
+            Ok(Some(GatewayAttributionV1 {
+                gateway_ref: reference,
+                sender_id,
+            }))
+        }
+        _ => Err(Error::Scope),
+    }
+}
+
+pub fn gateway_message_header_v1(message: &GatewayMessageHeaderV1) -> Result<Vec<u8>> {
+    validate_gateway_identifier_v1(&message.attribution.gateway_ref)?;
+    validate_gateway_identifier_v1(&message.attribution.sender_id)?;
+    let source = &message.message;
+    let direct = match message.target_seat_id {
+        Some(target_seat_id) => human_focused_header_v1(&HumanFocusedHeaderV1 {
+            chain_id: source.chain_id,
+            room_id: source.room_id,
+            seat_id: source.seat_id,
+            key_binding_commitment: source.key_binding_commitment,
+            key_generation: source.key_generation,
+            message_id: source.message_id,
+            target_seat_id,
+            reply_to: source.reply_to,
+        })?,
+        None => human_room_wide_header_v1(source)?,
+    };
+    let Value::Map(mut fields) = canonical::decode(&direct)? else {
+        return Err(Error::Schema);
+    };
+    for (key, value) in &mut fields {
+        match key.as_text() {
+            Some("role") => *value = Value::Text("external".into()),
+            Some("via") => *value = Value::Text(message.attribution.gateway_ref.clone()),
+            Some("via_sender") => *value = Value::Text(message.attribution.sender_id.clone()),
+            _ => {}
+        }
+    }
+    canonical::encode(Value::Map(fields))
+}
+
+pub fn seal_gateway_message_v1(
+    message: &GatewayMessageHeaderV1,
+    generation_secret: &[u8; 32],
+    plaintext: &[u8],
+    signing_seed: &[u8; 32],
+    expected_record_signing_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    if SigningKey::from_bytes(signing_seed)
+        .verifying_key()
+        .to_bytes()
+        != *expected_record_signing_key
+    {
+        return Err(Error::Authority);
+    }
+    envelope::seal(
+        &gateway_message_header_v1(message)?,
+        generation_secret,
+        plaintext,
+        signing_seed,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +423,7 @@ struct SealedRecord {
 }
 
 struct CheckedSourceSeatHeader {
+    attribution: Option<GatewayAttributionV1>,
     message_id: [u8; 32],
     reply_to: Option<[u8; 32]>,
     mentions: Vec<[u8; 32]>,
@@ -382,6 +502,7 @@ fn check_source_seat_record_header(
         nonzero_32(value)?;
     }
 
+    validate_source_profile(expected.source_seat_kind, expected.gateway_ref.as_deref())?;
     let expected_role = expected.source_seat_kind.header_role()?;
     let fields = parse_header(header)?;
     let mentions = fields
@@ -403,8 +524,6 @@ fn check_source_seat_record_header(
         || fields.text("room")? != expected_room
         || fields.text("seat")? != expected_seat
         || fields.text("role")? != expected_role
-        || fields.nullable_text("via")?.is_some()
-        || fields.nullable_text("via_sender")?.is_some()
         || fields.text("class")? != "message"
         || !matches!(fields.text("wake_hint")?.as_str(), "normal" | "urgent")
         || fields.uint("gen")? != expected.key_generation
@@ -414,6 +533,11 @@ fn check_source_seat_record_header(
         return Err(Error::Scope);
     }
     Ok(CheckedSourceSeatHeader {
+        attribution: check_attribution(
+            &fields,
+            expected.source_seat_kind,
+            expected.gateway_ref.as_deref(),
+        )?,
         message_id,
         reply_to,
         mentions,
@@ -427,7 +551,7 @@ pub fn authenticate_source_seat_header_v1(
     expected: &ExpectedSourceSeatRecordV1,
     source_record_signing_key: &[u8; 32],
 ) -> Result<AuthenticatedSourceSeatHeaderV1> {
-    expected.source_seat_kind.header_role()?;
+    validate_source_profile(expected.source_seat_kind, expected.gateway_ref.as_deref())?;
     nonzero_32(source_record_signing_key)?;
     let sealed = parse_sealed_record(sealed_record)?;
     envelope::verify_record(
@@ -438,6 +562,7 @@ pub fn authenticate_source_seat_header_v1(
     )?;
     let checked = check_source_seat_record_header(&sealed.header, expected)?;
     Ok(AuthenticatedSourceSeatHeaderV1 {
+        attribution: checked.attribution,
         message_id: checked.message_id,
         reply_to: checked.reply_to,
         mentions: checked.mentions,
@@ -451,6 +576,7 @@ pub fn authenticate_room_wide_source_seat_header_v1(
     expected: &ExpectedRoomWideSourceSeatRecordV1,
     source_record_signing_key: &[u8; 32],
 ) -> Result<AuthenticatedSourceSeatHeaderV1> {
+    validate_source_profile(expected.source_seat_kind, expected.gateway_ref.as_deref())?;
     let expected_role = expected.source_seat_kind.header_role()?;
     nonzero_32(source_record_signing_key)?;
     if expected.chain_id == 0 || expected.key_generation == 0 {
@@ -477,8 +603,6 @@ pub fn authenticate_room_wide_source_seat_header_v1(
         || fields.text("room")? != hex32(&expected.room_id)
         || fields.text("seat")? != hex32(&expected.source_seat_id)
         || fields.text("role")? != expected_role
-        || fields.nullable_text("via")?.is_some()
-        || fields.nullable_text("via_sender")?.is_some()
         || fields.text("class")? != "message"
         || fields.text("wake_hint")? != "normal"
         || fields.uint("gen")? != expected.key_generation
@@ -488,6 +612,11 @@ pub fn authenticate_room_wide_source_seat_header_v1(
         return Err(Error::Scope);
     }
     Ok(AuthenticatedSourceSeatHeaderV1 {
+        attribution: check_attribution(
+            &fields,
+            expected.source_seat_kind,
+            expected.gateway_ref.as_deref(),
+        )?,
         message_id: parse_hex32(fields.text("message_id")?)?,
         reply_to: fields
             .nullable_text("reply_to")?
@@ -518,6 +647,7 @@ pub fn open_room_wide_source_seat_record_v1(
     )?;
     let (paired_salt, plaintext) = open_source_body(&header.message_id, plaintext)?;
     Ok(OpenedSourceSeatRecordV1 {
+        attribution: header.attribution,
         message_id: header.message_id,
         reply_to: header.reply_to,
         mentions: header.mentions,
@@ -546,10 +676,9 @@ pub fn open_source_seat_record_v1(
     source_record_signing_key: &[u8; 32],
     generation_secret: &[u8; 32],
 ) -> Result<OpenedSourceSeatRecordV1> {
-    // Gateway records require provider attribution fields that this direct
-    // seat profile does not understand. Refuse them before parsing or opening
-    // any caller-controlled ciphertext.
-    expected.source_seat_kind.header_role()?;
+    // Refuse a missing or misapplied Gateway authority reference before
+    // parsing or opening caller-controlled ciphertext.
+    validate_source_profile(expected.source_seat_kind, expected.gateway_ref.as_deref())?;
     nonzero_32(source_record_signing_key)?;
     let sealed = parse_sealed_record(sealed_record)?;
     envelope::verify_record(
@@ -568,6 +697,7 @@ pub fn open_source_seat_record_v1(
     )?;
     let (paired_salt, plaintext) = open_source_body(&checked.message_id, plaintext)?;
     Ok(OpenedSourceSeatRecordV1 {
+        attribution: checked.attribution,
         message_id: checked.message_id,
         reply_to: checked.reply_to,
         mentions: checked.mentions,
@@ -747,6 +877,7 @@ mod focused_message_tests {
             room_id: header.room_id,
             source_seat_id: header.seat_id,
             source_seat_kind: SourceSeatKindV1::Human,
+            gateway_ref: None,
             source_key_binding_commitment: header.key_binding_commitment,
             key_generation: header.key_generation,
             target_seat_id: header.target_seat_id,
@@ -801,6 +932,7 @@ mod focused_message_tests {
             room_id: header.room_id,
             source_seat_id: header.seat_id,
             source_seat_kind: SourceSeatKindV1::Human,
+            gateway_ref: None,
             source_key_binding_commitment: header.key_binding_commitment,
             key_generation: header.key_generation,
         };
@@ -819,6 +951,7 @@ mod focused_message_tests {
                     room_id: header.room_id,
                     source_seat_id: header.seat_id,
                     source_seat_kind: SourceSeatKindV1::Human,
+                    gateway_ref: None,
                     source_key_binding_commitment: header.key_binding_commitment,
                     key_generation: header.key_generation,
                     target_seat_id: [0x57; 32],
