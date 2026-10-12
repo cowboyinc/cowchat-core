@@ -87,6 +87,10 @@ pub struct NativeRoomWideMaterial<'a> {
 pub enum SendDeliveryStatus {
     CommittedRoutingPending,
     Routed,
+    /// The append committed, but this client cannot interpret the delivery state.
+    /// This never implies routing succeeded or that the append should be retried.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +326,107 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn delivery_status_keeps_known_states_and_rejects_non_strings() {
+        assert_eq!(
+            serde_json::from_str::<SendDeliveryStatus>("\"routed\"").unwrap(),
+            SendDeliveryStatus::Routed
+        );
+        assert_eq!(
+            serde_json::from_str::<SendDeliveryStatus>("\"committed_routing_pending\"").unwrap(),
+            SendDeliveryStatus::CommittedRoutingPending
+        );
+        assert_eq!(
+            serde_json::from_str::<SendDeliveryStatus>("\"new_state\"").unwrap(),
+            SendDeliveryStatus::Unknown
+        );
+        for malformed in ["null", "false", "42", "{}", "[]"] {
+            assert!(serde_json::from_str::<SendDeliveryStatus>(malformed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_send_keeps_receipt_when_delivery_status_is_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let register =
+                Frame::from_line(&read_frame_line(&mut reader).await.unwrap().unwrap()).unwrap();
+            write
+                .write_all(
+                    Frame::ok(
+                        register.id.as_deref(),
+                        serde_json::json!({"agent_id": "sender"}),
+                    )
+                    .to_line()
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let send =
+                Frame::from_line(&read_frame_line(&mut reader).await.unwrap().unwrap()).unwrap();
+            assert_eq!(send.frame_type, FrameType::SendMessage);
+            assert_eq!(send.payload["message_id"], "committed-message");
+            let response = serde_json::json!({
+                "message_id": "committed-message", "room_id": "room", "agent_id": "sender",
+                "agent_name": "Sender", "content": "committed", "metadata": {},
+                "timestamp": "2026-10-11T00:00:00Z", "seq": 42,
+                "delivery_status": "future_routing_state"
+            });
+            write
+                .write_all(
+                    Frame::ok(send.id.as_deref(), response)
+                        .to_line()
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let client = CowchatClient::connect_tcp(
+            &address.to_string(),
+            "test-key",
+            "Sender",
+            Some("sender"),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let payload = SendMessagePayload {
+            message_id: Some("committed-message".into()),
+            room_id: "room".into(),
+            content: "committed".into(),
+            key_epoch: None,
+            reply_to: None,
+            metadata: serde_json::json!({}),
+            mentions: vec![],
+            native_focused: Some(NativeFocusedSend {
+                target_handle: "actor".into(),
+                sealed_record_hex: "00".into(),
+                signed_intent_hex: "00".into(),
+                native_routing_intent_hex: "00".into(),
+            }),
+            native_room_wide: None,
+        };
+        let result = client
+            .append_prepared_message_with_status(&payload)
+            .await
+            .expect("an unknown delivery state must retain the committed receipt");
+        assert_eq!(result.message.message_id, "committed-message");
+        assert_eq!(result.message.seq, 42);
+        assert!(result.delivery_status.is_some());
+        assert_ne!(result.delivery_status, Some(SendDeliveryStatus::Routed));
+        assert_ne!(
+            result.delivery_status,
+            Some(SendDeliveryStatus::CommittedRoutingPending)
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn focused_native_prepare_binds_exact_sealed_record_and_target() {
