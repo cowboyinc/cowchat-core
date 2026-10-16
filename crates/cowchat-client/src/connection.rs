@@ -1823,6 +1823,7 @@ impl CowchatClient {
             since: since.map(String::from),
             since_seq,
         })?;
+        payload["bounded_pages"] = serde_json::json!(true);
         let forward = since_seq.is_some() || since.is_some();
         let mut messages = Vec::new();
         let mut previous_cursor = since_seq;
