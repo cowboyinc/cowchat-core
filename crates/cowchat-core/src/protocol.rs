@@ -101,6 +101,8 @@ pub enum FrameType {
     ListRooms,
     ListAgents,
     RoomInfo,
+    /// Room-scoped coordination: leases, heartbeats, fencing and readiness.
+    RoomCoordination,
     RoomTip,
     PrepareRoomKey,
     AttestRoomKeySetup,
