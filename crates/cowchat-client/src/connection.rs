@@ -1816,25 +1816,63 @@ impl CowchatClient {
         since: Option<&str>,
         since_seq: Option<i64>,
     ) -> Result<Vec<ChatMessage>, ClientError> {
-        let resp = self
-            .request(
-                FrameType::GetHistory,
-                serde_json::to_value(GetHistoryPayload {
-                    room_id: room_id.to_string(),
-                    limit,
-                    before,
-                    since: since.map(String::from),
-                    since_seq,
-                })
-                .unwrap(),
-            )
-            .await?;
-        let mut messages: Vec<ChatMessage> = resp
-            .payload
-            .get("messages")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default();
+        let mut payload = serde_json::to_value(GetHistoryPayload {
+            room_id: room_id.to_string(),
+            limit,
+            before,
+            since: since.map(String::from),
+            since_seq,
+        })?;
+        payload["bounded_pages"] = serde_json::json!(true);
+        let forward = since_seq.is_some() || since.is_some();
+        let mut messages = Vec::new();
+        let mut previous_cursor = since_seq;
+        loop {
+            payload["limit"] = serde_json::json!(limit.saturating_sub(messages.len() as u32));
+            let response = self.request(FrameType::GetHistory, payload.clone()).await?;
+            let page: Vec<ChatMessage> = serde_json::from_value(
+                response
+                    .payload
+                    .get("messages")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )?;
+            let more = response.payload["has_more"].as_bool() == Some(true);
+            let cursor = if forward { page.last() } else { page.first() }.map(|m| m.seq);
+            if more
+                && (page.is_empty()
+                    || cursor.is_none()
+                    || previous_cursor.is_some_and(|old| {
+                        if forward {
+                            cursor.unwrap() <= old
+                        } else {
+                            cursor.unwrap() >= old
+                        }
+                    }))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "History pagination did not advance",
+                )
+                .into());
+            }
+            if forward {
+                messages.extend(page);
+            } else {
+                messages.splice(0..0, page);
+            }
+            if !more || messages.len() >= limit as usize {
+                break;
+            }
+            previous_cursor = cursor;
+            payload["since"] = serde_json::Value::Null;
+            payload["before"] = serde_json::Value::Null;
+            if forward {
+                payload["since_seq"] = serde_json::json!(cursor);
+            } else {
+                payload["before_seq"] = serde_json::json!(cursor);
+            }
+        }
         for msg in &mut messages {
             self.decrypt_message(msg);
         }
@@ -2799,6 +2837,87 @@ impl CowchatClient {
             {
                 return Ok(msg);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_pagination_tests {
+    use super::*;
+    #[tokio::test]
+    async fn history_collects_bounded_pages_in_both_directions() {
+        for forward in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = tokio::io::split(stream);
+                let mut read = BufReader::new(read);
+                let register =
+                    Frame::from_line(&read_frame_line(&mut read).await.unwrap().unwrap()).unwrap();
+                write
+                    .write_all(
+                        Frame::ok(
+                            register.id.as_deref(),
+                            serde_json::json!({"agent_id":"reader"}),
+                        )
+                        .to_line()
+                        .unwrap()
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                for index in 0..2 {
+                    let request =
+                        Frame::from_line(&read_frame_line(&mut read).await.unwrap().unwrap())
+                            .unwrap();
+                    assert_eq!(request.frame_type, FrameType::GetHistory);
+                    if index == 1 {
+                        assert_eq!(
+                            request.payload[if forward { "since_seq" } else { "before_seq" }],
+                            if forward { 1 } else { 3 }
+                        );
+                        assert_eq!(request.payload["limit"], 2);
+                    }
+                    let seqs = match (forward, index) {
+                        (false, 0) => vec![3],
+                        (false, _) => vec![1, 2],
+                        (true, 0) => vec![1],
+                        (true, _) => vec![2, 3],
+                    };
+                    let messages: Vec<_> = seqs.into_iter().map(|seq|serde_json::json!({"message_id":format!("m{seq}"),"room_id":"room","agent_id":"writer","agent_name":"Writer","content":"hello","metadata":{},"timestamp":"2026-10-16T00:00:00Z","seq":seq})).collect();
+                    write
+                        .write_all(
+                            Frame::ok(
+                                request.id.as_deref(),
+                                serde_json::json!({"messages":messages,"has_more":index==0}),
+                            )
+                            .to_line()
+                            .unwrap()
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = CowchatClient::connect_tcp(
+                &addr.to_string(),
+                "key",
+                "reader",
+                Some("reader"),
+                vec![],
+            )
+            .await
+            .unwrap();
+            let messages = client
+                .get_history_filtered("room", 3, None, None, if forward { Some(0) } else { None })
+                .await
+                .unwrap();
+            assert_eq!(
+                messages.iter().map(|m| m.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            server.await.unwrap();
         }
     }
 }
