@@ -15,17 +15,18 @@ pub(crate) fn sign_ed25519(seed: &[u8], input: &[u8]) -> Result<Vec<u8>> {
 }
 pub(crate) fn recover_wallet(sig: &[u8], input: &[u8]) -> Result<[u8; 20]> {
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use k256::elliptic_curve::scalar::IsHigh;
     if sig.len() != 65 {
         return Err(Error::Signature);
     }
     let signature = Signature::from_slice(&sig[..64]).map_err(|_| Error::Signature)?;
-    if signature.normalize_s().is_some() {
+    if bool::from(signature.s().is_high()) {
         return Err(Error::Signature);
     }
     let recid = RecoveryId::from_byte(sig[64]).ok_or(Error::Signature)?;
     let key = VerifyingKey::recover_from_prehash(&Keccak256::digest(input), &signature, recid)
         .map_err(|_| Error::Signature)?;
-    let encoded = key.to_encoded_point(false);
+    let encoded = key.to_sec1_point(false);
     let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
     digest[12..].try_into().map_err(|_| Error::Signature)
 }
