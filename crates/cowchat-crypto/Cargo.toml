@@ -13,9 +13,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 ciborium = "0.2"
 ed25519-dalek = { version = "2", features = ["zeroize"] }
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
 sha3 = "0.10"
-hpke = { version = "0.13", features = ["x25519"] }
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 zeroize = "1"
 rand = "0.9"
 hex = "0.4"
