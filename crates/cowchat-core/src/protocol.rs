@@ -169,6 +169,8 @@ pub enum FrameType {
     AgentLeft,
     RoomCreated,
     RoomUpdated,
+    /// Sent to an admitted session when a person approves it for a room.
+    RoomApproved,
     RoomDestroyed,
     PresenceUpdate,
     HistoryResult,
@@ -230,6 +232,10 @@ mod tests {
         assert_eq!(json, "\"rename_room\"");
         let parsed: FrameType = serde_json::from_str("\"room_updated\"").unwrap();
         assert_eq!(parsed, FrameType::RoomUpdated);
+        assert_eq!(
+            serde_json::to_string(&FrameType::RoomApproved).unwrap(),
+            "\"room_approved\""
+        );
     }
 
     #[test]
