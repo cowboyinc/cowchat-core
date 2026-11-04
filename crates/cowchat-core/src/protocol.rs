@@ -171,6 +171,7 @@ pub enum FrameType {
     RoomUpdated,
     /// Sent to an admitted session when a person approves it for a room.
     RoomApproved,
+    SessionState,
     RoomDestroyed,
     PresenceUpdate,
     HistoryResult,
@@ -235,6 +236,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FrameType::RoomApproved).unwrap(),
             "\"room_approved\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FrameType::SessionState).unwrap(),
+            "\"session_state\""
         );
     }
 
