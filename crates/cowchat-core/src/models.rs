@@ -711,6 +711,9 @@ pub struct SubscribePayload {
     pub secret: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
+    /// Tag filters in `key` or `key=value` form. Any match delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -837,6 +840,9 @@ pub struct Subscription {
     pub webhook_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
+    /// Tag filters in `key` or `key=value` form. Any match delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

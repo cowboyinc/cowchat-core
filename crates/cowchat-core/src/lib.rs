@@ -5,6 +5,7 @@ pub mod models;
 pub mod native_route;
 pub mod protocol;
 pub mod room_crypto;
+pub mod tags;
 
 pub use error::{ErrorCode, ErrorPayload};
 pub use models::*;

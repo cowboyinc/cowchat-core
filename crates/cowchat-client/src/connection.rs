@@ -2660,6 +2660,35 @@ impl CowchatClient {
         exclude_thinking: bool,
         since_seq: Option<i64>,
     ) -> Result<Subscription, ClientError> {
+        self.create_tagged_subscription(
+            room_id,
+            webhook_url,
+            secret,
+            kinds,
+            Vec::new(),
+            only_from,
+            not_from,
+            exclude_thinking,
+            since_seq,
+        )
+        .await
+    }
+
+    /// As [`Self::create_subscription`], delivering only messages carrying one of
+    /// `tags` (`key` or `key=value`). An empty list delivers every message.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tagged_subscription(
+        &self,
+        room_id: &str,
+        webhook_url: &str,
+        secret: &str,
+        kinds: Vec<String>,
+        tags: Vec<String>,
+        only_from: Option<&str>,
+        not_from: Option<&str>,
+        exclude_thinking: bool,
+        since_seq: Option<i64>,
+    ) -> Result<Subscription, ClientError> {
         let resp = self
             .request(
                 FrameType::Subscribe,
@@ -2668,6 +2697,7 @@ impl CowchatClient {
                     webhook_url: webhook_url.to_string(),
                     secret: secret.to_string(),
                     kinds,
+                    tags,
                     only_from: only_from.map(String::from),
                     not_from: not_from.map(String::from),
                     exclude_thinking,
