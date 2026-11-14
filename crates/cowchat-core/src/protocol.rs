@@ -9,7 +9,42 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Oldest protocol version the server still accepts. A client below this is
 /// asked to upgrade rather than failing later with a confusing parse error.
 /// A missing version in a register frame is treated as `1` (pre-versioning).
+///
+/// Equal to [`PROTOCOL_VERSION`] today, so v1 peers — and any client omitting
+/// `protocol_version`, which is read as 1 — are refused at register. Deliberate:
+/// v1 predates the version gate entirely.
+///
+/// **Bumping [`PROTOCOL_VERSION`] cannot signal unknown-frame tolerance.** The
+/// server admits exactly `MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION`
+/// (`server.rs`), so a client advertising a higher version is rejected by every
+/// already-deployed server as "newer than this server".
+///
+/// A signal *is* available without a bump: `RegisterPayload.capabilities` is a
+/// free-form list the server only logs and records — no whitelist, no
+/// rejection — so a tolerant client can advertise `"frame-type-unknown"` and
+/// every deployed v0.9.1 server accepts it unchanged. `cowchat-client` sends
+/// that string on every register as of this change. The register reply is
+/// likewise an open object, so a server can answer with its own
+/// `capabilities` without breaking any deployed client. Nothing *checks* the
+/// string yet: until a server does, treat a peer as intolerant.
+///
+/// Consequence for anyone adding a frame type: a peer that predates
+/// [`FrameType::Unknown`] drops the line entirely, so a new *event* must be
+/// optional and a new *reply type* will make such a peer block until timeout.
+/// Capability negotiation in the register reply is the real fix; see the protocol
+/// issues.
+///
+/// Raising this is a release-note event, not a routine change.
 pub const MIN_SUPPORTED_PROTOCOL: u32 = 2;
+
+/// Capability string a client sends in `RegisterPayload.capabilities` to say
+/// it parses unknown frame types as [`FrameType::Unknown`] instead of dropping
+/// the line. `cowchat-client` sends it on every register; no server checks it
+/// yet. A future server gating a new frame type on tolerance must match this
+/// exact string, so it lives here rather than as a literal in each crate. See
+/// [`MIN_SUPPORTED_PROTOCOL`] for why this — not a version bump — is the only
+/// usable signal.
+pub const CAP_FRAME_TYPE_UNKNOWN: &str = "frame-type-unknown";
 
 /// Every message on the wire is a Frame, serialized as a single line of JSON (NDJSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +122,7 @@ impl Frame {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FrameType {
     // Client -> Server commands
     Register,
@@ -200,6 +236,23 @@ pub enum FrameType {
 
     // Turn token events (server -> client)
     TurnChanged,
+
+    /// Any frame type this build does not know.
+    ///
+    /// Without this, `Frame::from_line` rejects the whole line before dispatch
+    /// sees it, so adding a frame type is a breaking change for every already
+    /// deployed peer. With it, receivers degrade instead of failing:
+    ///
+    /// - **Unknown events are ignored.** Never disconnect over one.
+    /// - **Unknown requests get a correlated error.** The server's dispatch
+    ///   catch-all answers with `reply_to` set, so a caller fails fast rather
+    ///   than blocking until timeout.
+    ///
+    /// Must stay a *unit* variant: `#[serde(other)]` is only permitted on one,
+    /// so the original type string cannot be preserved here. A path that needs
+    /// it should keep the undecoded `Frame`.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]

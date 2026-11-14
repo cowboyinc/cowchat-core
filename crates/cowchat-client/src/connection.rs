@@ -327,6 +327,328 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
 
+    /// The debug diagnostic must never carry a payload. `create_invite`'s reply
+    /// contains a live `cinv_…` token, and `RUST_LOG=debug` output reaches CI logs
+    /// and agent transcripts — the exact channel the invite-hygiene work closes.
+    /// Truncation marks exactly the values it shortened, counted after escaping.
+    #[test]
+    fn the_frame_diagnostic_marks_only_truncated_values() {
+        let newlines = format!(r#"{{"type":"{}"}}"#, "\\n".repeat(40));
+        let rendered = super::render_frame_diagnostic(&newlines);
+        assert!(
+            rendered.contains('…'),
+            "80 escaped chars were cut: {rendered}"
+        );
+
+        let short = r#"{"type":"éééééééééééééééééééééééééééééé"}"#;
+        let rendered = super::render_frame_diagnostic(short);
+        assert!(!rendered.contains('…'), "30 chars fit in 64: {rendered}");
+    }
+
+    /// A malformed error payload keeps its message and never reads as a genuine
+    /// `InternalError`.
+    #[test]
+    fn decode_error_payload_never_invents_internal_error() {
+        let missing = super::decode_error_payload(serde_json::json!({"message": "slow down"}));
+        assert_eq!(missing.code, ErrorCode::Unknown);
+        assert_eq!(missing.message, "slow down");
+
+        let numeric =
+            super::decode_error_payload(serde_json::json!({"code": 5, "message": "slow down"}));
+        assert_eq!(numeric.code, ErrorCode::Unknown);
+        assert_eq!(numeric.message, "slow down");
+
+        let bare = super::decode_error_payload(serde_json::json!({"code": 5}));
+        assert_eq!(bare.code, ErrorCode::Unknown);
+        assert!(!bare.message.is_empty());
+
+        let unknown_code = super::decode_error_payload(
+            serde_json::json!({"code": "quota_exhausted", "message": "upgrade"}),
+        );
+        assert_eq!(unknown_code.code, ErrorCode::Unknown);
+        assert_eq!(unknown_code.message, "upgrade");
+    }
+
+    /// An unsolicited event of a type this build does not know reaches
+    /// subscribers as `FrameType::Unknown`, and the connection keeps working.
+    #[tokio::test]
+    async fn an_unknown_event_is_delivered_and_the_connection_stays_usable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let register = Frame::from_line(&register).unwrap();
+            let ok = Frame::ok(
+                register.id.as_deref(),
+                serde_json::json!({"agent_id": "probe"}),
+            );
+            write_half
+                .write_all(ok.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+
+            let ping = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let ping = Frame::from_line(&ping).unwrap();
+            write_half
+                .write_all(
+                    b"{\"id\":\"evt-1\",\"type\":\"some_future_event\",\"payload\":{\"a\":1}}\n",
+                )
+                .await
+                .unwrap();
+            let pong = Frame {
+                id: Some("s2".into()),
+                reply_to: ping.id.clone(),
+                frame_type: FrameType::Pong,
+                payload: serde_json::json!({}),
+            };
+            write_half
+                .write_all(pong.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = CowchatClient::connect_tcp(
+            &addr.to_string(),
+            "test-key",
+            "client",
+            Some("probe"),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let mut events = client.subscribe();
+        client
+            .ping()
+            .await
+            .expect("the connection survives an unknown event");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.frame.frame_type == FrameType::Unknown {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the unknown event reaches subscribers");
+        assert_eq!(event.frame.id.as_deref(), Some("evt-1"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn the_frame_diagnostic_never_logs_a_payload() {
+        // The real create_invite reply shape: the token rides in the payload.
+        let line = r#"{"id":"x","reply_to":"r1","type":"ok","payload":{"token":"cinv_canary_deadbeef","api_key":"k_canary"}}"#;
+        let rendered = super::render_frame_diagnostic(line);
+
+        assert!(
+            !rendered.contains("cinv_canary_deadbeef"),
+            "an invite token must never reach the log: {rendered}"
+        );
+        assert!(
+            !rendered.contains("k_canary"),
+            "an api key must never reach the log: {rendered}"
+        );
+        assert!(
+            !rendered.contains("payload"),
+            "no part of the payload belongs in the diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("type=ok"), "{rendered}");
+        assert!(rendered.contains("reply_to=r1"), "{rendered}");
+    }
+
+    /// The logged fields come from the peer and land in transcripts, so a crafted
+    /// `type` must not be able to forge a log line or flood the log.
+    #[test]
+    fn the_frame_diagnostic_neutralises_a_hostile_type() {
+        // Valid JSON whose decoded `type` contains a newline.
+        let line = r#"{"type":"ok\nWARN cowchat: auth failed, key=0f1e2d","id":"x"}"#;
+        let rendered = super::render_frame_diagnostic(line);
+        assert!(
+            rendered.contains(r"type=ok\nWARN cowchat"),
+            "the hostile type must reach the renderer, escaped: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "a newline in `type` would forge a second log line: {rendered}"
+        );
+
+        let long = format!(r#"{{"type":"{}","id":"x"}}"#, "A".repeat(4096));
+        let rendered = super::render_frame_diagnostic(&long);
+        assert!(
+            rendered.len() < 400,
+            "a 4 KiB type must not produce a 4 KiB log line: {} chars",
+            rendered.len()
+        );
+    }
+
+    /// A reply this build cannot parse used to fail deserialization and surface as a
+    /// timeout. `FrameType::Unknown` removed that accidental backstop, so
+    /// `finish_register` must reject it explicitly — otherwise registration
+    /// "succeeds", `agent_id` falls back to the literal "unknown", and two such
+    /// clients each treat the other's messages as their own.
+    ///
+    /// Deleting the guard in `finish_register` must make this test fail.
+    #[tokio::test]
+    async fn register_rejects_a_reply_type_it_does_not_understand() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let register = Frame::from_line(&register).unwrap();
+            let line = format!(
+                "{{\"id\":\"s1\",\"reply_to\":\"{}\",\"type\":\"register_ok\",\"payload\":{{}}}}\n",
+                register.id.unwrap()
+            );
+            write_half.write_all(line.as_bytes()).await.unwrap();
+        });
+
+        let result = CowchatClient::connect_tcp(
+            &addr.to_string(),
+            "test-key",
+            "client",
+            Some("probe"),
+            vec![],
+        )
+        .await;
+        match result {
+            Err(ClientError::Server { code, .. }) => {
+                assert_eq!(code, ErrorCode::UnsupportedProtocol)
+            }
+            Err(other) => panic!("expected UnsupportedProtocol, got {other:?}"),
+            Ok(_) => panic!("an unintelligible reply must not read as a successful register"),
+        }
+        server.await.unwrap();
+    }
+
+    /// The same hole in `request()`: `ping()` discards its response, so without the
+    /// guard an unknown reply returns Ok and the caller believes the server answered.
+    /// Deleting the guard in `request` must make this test fail.
+    #[tokio::test]
+    async fn request_rejects_a_reply_type_it_does_not_understand() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let register = Frame::from_line(&register).unwrap();
+            let ok = Frame::ok(
+                register.id.as_deref(),
+                serde_json::json!({"agent_id": "probe"}),
+            );
+            write_half
+                .write_all(ok.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+
+            let req = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let req = Frame::from_line(&req).unwrap();
+            let line = format!(
+                "{{\"id\":\"s2\",\"reply_to\":\"{}\",\"type\":\"pong_v2\",\"payload\":{{}}}}\n",
+                req.id.unwrap()
+            );
+            write_half.write_all(line.as_bytes()).await.unwrap();
+        });
+
+        let client = CowchatClient::connect_tcp(
+            &addr.to_string(),
+            "test-key",
+            "client",
+            Some("probe"),
+            vec![],
+        )
+        .await
+        .unwrap();
+        match client.ping().await {
+            Err(ClientError::Server { code, .. }) => {
+                assert_eq!(code, ErrorCode::UnsupportedProtocol)
+            }
+            Err(other) => panic!("expected UnsupportedProtocol, got {other:?}"),
+            Ok(()) => panic!("ping must not report success for a reply it cannot read"),
+        }
+        server.await.unwrap();
+    }
+
+    /// Registration must advertise `frame-type-unknown`. The tolerance this
+    /// change adds is invisible on the wire, and a version bump cannot signal it
+    /// (the server admits exactly `MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION`),
+    /// so the capability string is the only way a future server can ever tell
+    /// tolerant clients from intolerant ones. Shipping tolerance without the
+    /// advert would spend a whole deployment wave advancing nothing detectable.
+    #[tokio::test]
+    async fn register_advertises_unknown_frame_tolerance() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Two connections: one where the caller says nothing about the
+            // capability, one where the caller already advertises it.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half);
+                let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+                let register = Frame::from_line(&register).unwrap();
+                let payload: RegisterPayload =
+                    serde_json::from_value(register.payload.clone()).unwrap();
+                assert!(
+                    payload
+                        .capabilities
+                        .iter()
+                        .any(|c| c == CAP_FRAME_TYPE_UNKNOWN),
+                    "a tolerant client must say so: capabilities were {:?}",
+                    payload.capabilities
+                );
+                // The caller's own capabilities must survive alongside the advert.
+                assert!(
+                    payload.capabilities.iter().any(|c| c == "caller-cap"),
+                    "caller capabilities must not be replaced: {:?}",
+                    payload.capabilities
+                );
+                assert_eq!(
+                    payload
+                        .capabilities
+                        .iter()
+                        .filter(|c| c.as_str() == CAP_FRAME_TYPE_UNKNOWN)
+                        .count(),
+                    1,
+                    "the advert must not duplicate one the caller already passed"
+                );
+                let ok = Frame::ok(
+                    register.id.as_deref(),
+                    serde_json::json!({"agent_id": "probe"}),
+                );
+                write_half
+                    .write_all(ok.to_line().unwrap().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for caller_caps in [
+            vec!["caller-cap".to_string()],
+            vec!["caller-cap".to_string(), CAP_FRAME_TYPE_UNKNOWN.to_string()],
+        ] {
+            CowchatClient::connect_tcp(
+                &addr.to_string(),
+                "test-key",
+                "client",
+                Some("probe"),
+                caller_caps,
+            )
+            .await
+            .unwrap();
+        }
+        server.await.unwrap();
+    }
+
     #[test]
     fn delivery_status_keeps_known_states_and_rejects_non_strings() {
         assert_eq!(
@@ -1030,6 +1352,72 @@ pub struct CowchatClient {
     hosted_keys: HashMap<(String, u64), zeroize::Zeroizing<[u8; 32]>>,
 }
 
+/// Log an inbound frame's *type* at debug, never its payload.
+///
+/// The unit `Unknown` variant discards the original type string, so without this
+/// `RUST_LOG=debug` cannot answer "what type was that?". Logging the raw line
+/// would answer it — and would also write `create_invite`'s reply, which carries
+/// a live `cinv_…` token, straight into the log. The type is what the diagnostic
+/// needs; the payload is what leaks.
+fn log_frame_type(line: &str) {
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!("{}", render_frame_diagnostic(line));
+    }
+}
+
+/// The exact text `log_frame_type` emits. Split out so a test can assert on what
+/// is actually logged rather than on a string the test built itself.
+fn render_frame_diagnostic(line: &str) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(line).ok();
+    let field = |name: &str| -> String {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string()
+    };
+    // These values come from the peer, and this text lands in CI logs and agent
+    // transcripts. Escaping keeps a crafted `type` from forging a log line;
+    // truncation keeps a 1 MiB one from flooding it.
+    let safe = |v: String| -> String {
+        let mut escaped = v.escape_debug();
+        let mut out: String = escaped.by_ref().take(64).collect();
+        if escaped.next().is_some() {
+            out.push('…');
+        }
+        out
+    };
+    format!(
+        "frame in: type={} id={} reply_to={} ({} bytes)",
+        safe(field("type")),
+        safe(field("id")),
+        safe(field("reply_to")),
+        line.len()
+    )
+}
+
+/// Decode an error payload, keeping the operator-actionable message even when the
+/// shape is off.
+///
+/// `ErrorCode` has `#[serde(other)]`, so an unrecognized *code* already decodes
+/// to `Unknown`; this covers the narrower case of a missing or non-string `code`
+/// beside a usable `message`. It never falls back to `InternalError`, which is a
+/// code the server genuinely emits — a caller must be able to tell "the server
+/// said internal error" from "this client could not read the error".
+fn decode_error_payload(payload: serde_json::Value) -> ErrorPayload {
+    let message = payload
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    serde_json::from_value(payload).unwrap_or_else(|_| {
+        ErrorPayload::new(
+            ErrorCode::Unknown,
+            message.unwrap_or_else(|| "the server sent an error this client could not read".into()),
+        )
+    })
+}
+
 impl CowchatClient {
     /// Connect via Unix domain socket and register.
     pub async fn connect_uds(
@@ -1109,6 +1497,7 @@ impl CowchatClient {
                 match read_frame_line(&mut reader).await {
                     Ok(None) => break, // EOF
                     Ok(Some(line)) => {
+                        log_frame_type(&line);
                         if let Ok(frame) = Frame::from_line(&line) {
                             if frame.frame_type == FrameType::Ping {
                                 if let Some(tx) = pong_tx.upgrade() {
@@ -1221,6 +1610,7 @@ impl CowchatClient {
                 if text.len() > MAX_FRAME_BYTES {
                     break;
                 }
+                log_frame_type(&text);
                 if let Ok(frame) = Frame::from_line(&text) {
                     if frame.frame_type == FrameType::Ping {
                         if let Some(tx) = pong_tx.upgrade() {
@@ -1270,6 +1660,17 @@ impl CowchatClient {
         capabilities: Vec<String>,
     ) -> Result<Self, ClientError> {
         let stable_identity = agent_id.is_some();
+        // Advertise unknown-frame tolerance. A version bump cannot carry this
+        // signal (the server admits exactly MIN_SUPPORTED_PROTOCOL..=
+        // PROTOCOL_VERSION, so advertising higher gets this client refused), and
+        // deployed servers accept free-form capabilities unchanged — so this
+        // string is the only way a future server can ever know it may send this
+        // client a frame type it did not ship with. See MIN_SUPPORTED_PROTOCOL's
+        // doc comment in cowchat-core.
+        let mut capabilities = capabilities;
+        if !capabilities.iter().any(|c| c == CAP_FRAME_TYPE_UNKNOWN) {
+            capabilities.push(CAP_FRAME_TYPE_UNKNOWN.to_string());
+        }
         let register_frame = Frame {
             id: Some(uuid::Uuid::new_v4().to_string()),
             reply_to: None,
@@ -1306,9 +1707,21 @@ impl CowchatClient {
             .map_err(|_| ClientError::Timeout)?
             .map_err(|_| ClientError::ConnectionClosed)?;
 
+        // Before FrameType tolerated unknown values, a reply this build did not
+        // understand failed to parse and surfaced as a timeout. That accidental
+        // backstop is gone, so reject it explicitly: every check below assumes a
+        // reply we actually understand.
+        if response.frame_type == FrameType::Unknown {
+            return Err(ClientError::Server {
+                code: ErrorCode::UnsupportedProtocol,
+                message: "the server replied with a frame type this client does not \
+                          understand; the request may or may not have taken effect"
+                    .into(),
+            });
+        }
+
         if response.frame_type == FrameType::Error {
-            let err: ErrorPayload = serde_json::from_value(response.payload)
-                .unwrap_or(ErrorPayload::new(ErrorCode::InternalError, "Unknown error"));
+            let err = decode_error_payload(response.payload);
             return Err(ClientError::Server {
                 code: err.code,
                 message: err.message,
@@ -1559,9 +1972,20 @@ impl CowchatClient {
             }
         };
 
+        // Parse failure used to reject a reply this build did not understand;
+        // FrameType::Unknown removed that backstop, so reject it explicitly
+        // rather than handing an unintelligible frame back as success.
+        if response.frame_type == FrameType::Unknown {
+            return Err(ClientError::Server {
+                code: ErrorCode::UnsupportedProtocol,
+                message: "the server replied with a frame type this client does not \
+                          understand; the request may or may not have taken effect"
+                    .into(),
+            });
+        }
+
         if response.frame_type == FrameType::Error {
-            let err: ErrorPayload = serde_json::from_value(response.payload)
-                .unwrap_or(ErrorPayload::new(ErrorCode::InternalError, "Unknown error"));
+            let err = decode_error_payload(response.payload);
             return Err(ClientError::Server {
                 code: err.code,
                 message: err.message,

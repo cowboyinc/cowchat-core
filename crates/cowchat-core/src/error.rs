@@ -17,6 +17,7 @@ impl ErrorPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCode {
     NotRegistered,
     RoomNotFound,
@@ -48,4 +49,13 @@ pub enum ErrorCode {
     InviteNotFound,
     /// Plaintext content was sent to an end-to-end encrypted room.
     PlaintextInEncryptedRoom,
+
+    /// A code this build does not know.
+    ///
+    /// Same hazard as an unknown frame type, one field deeper: without this a
+    /// newer peer's new code fails to deserialize and the operator-actionable
+    /// `message` beside it is discarded. Callers should surface `message`
+    /// regardless of whether they recognize the code.
+    #[serde(other)]
+    Unknown,
 }

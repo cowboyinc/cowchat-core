@@ -8,4 +8,6 @@ pub mod room_crypto;
 
 pub use error::{ErrorCode, ErrorPayload};
 pub use models::*;
-pub use protocol::{Frame, FrameType, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION};
+pub use protocol::{
+    Frame, FrameType, CAP_FRAME_TYPE_UNKNOWN, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+};
