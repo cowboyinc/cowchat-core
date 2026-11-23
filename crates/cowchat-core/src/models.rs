@@ -108,6 +108,22 @@ pub struct RegisterPayload {
     pub protocol_version: Option<u32>,
 }
 
+/// The server's reply to a successful `Register`. The server may add more
+/// fields (such as `session_room`); readers ignore the ones they don't know.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegisterReply {
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    /// Optional behaviours this server supports, such as
+    /// [`crate::FEATURE_SUBSCRIPTION_TAGS`]. Absent on older servers.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionProof {

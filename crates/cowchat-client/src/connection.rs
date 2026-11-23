@@ -1028,6 +1028,8 @@ pub struct CowchatClient {
     /// Hosted room keys by (room, key epoch). Replies use the room's newest
     /// epoch; claimed inputs decrypt with the epoch they carry.
     hosted_keys: HashMap<(String, u64), zeroize::Zeroizing<[u8; 32]>>,
+    /// Features the server advertised in its register reply.
+    server_features: Vec<String>,
 }
 
 impl CowchatClient {
@@ -1315,12 +1317,13 @@ impl CowchatClient {
             });
         }
 
-        let agent_id = response
-            .payload
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let reply: RegisterReply =
+            serde_json::from_value(response.payload).map_err(ClientError::Json)?;
+        let agent_id = if reply.agent_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            reply.agent_id
+        };
 
         Ok(Self {
             write_tx,
@@ -1331,6 +1334,7 @@ impl CowchatClient {
             stable_identity,
             room_secret: None,
             hosted_keys: HashMap::new(),
+            server_features: reply.features,
         })
     }
 
@@ -2678,9 +2682,9 @@ impl CowchatClient {
     /// `tags` (`key` or `key=value`). An empty list delivers every message.
     ///
     /// Servers without tag support ignore `tags` and would deliver every
-    /// message. So a tagged request first creates a probe subscription whose
-    /// `kinds` filter matches nothing, checks that the server echoed the tags,
-    /// and removes it. Only then is the real subscription created.
+    /// message, so a tagged request is refused unless the server advertised
+    /// [`FEATURE_SUBSCRIPTION_TAGS`] at register. As a backstop, a
+    /// subscription whose echo lacks the tags is removed.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_tagged_subscription(
         &self,
@@ -2708,30 +2712,24 @@ impl CowchatClient {
         if payload.tags.is_empty() {
             return self.send_subscribe(&payload).await;
         }
-        let probe = SubscribePayload {
-            kinds: vec![format!("cowchat-tag-probe-{}", uuid::Uuid::new_v4())],
-            since_seq: None,
-            ..payload.clone()
+        let unsupported = || {
+            ClientError::Protocol(
+                "server does not support tag-filtered subscriptions; upgrade the server".into(),
+            )
         };
-        let probe = self.subscribe_with_tags(&probe).await?;
-        self.unsubscribe(&probe.subscription_id).await?;
-        self.subscribe_with_tags(&payload).await
-    }
-
-    /// Subscribe, then require the server to echo `payload.tags`. On a
-    /// mismatch the subscription is removed and an error returned.
-    async fn subscribe_with_tags(
-        &self,
-        payload: &SubscribePayload,
-    ) -> Result<Subscription, ClientError> {
-        let subscription = self.send_subscribe(payload).await?;
-        if subscription.tags == payload.tags {
-            return Ok(subscription);
+        if !self
+            .server_features
+            .iter()
+            .any(|f| f == FEATURE_SUBSCRIPTION_TAGS)
+        {
+            return Err(unsupported());
         }
-        self.unsubscribe(&subscription.subscription_id).await?;
-        Err(ClientError::Protocol(
-            "server does not support tag-filtered subscriptions; upgrade the server".into(),
-        ))
+        let subscription = self.send_subscribe(&payload).await?;
+        if subscription.tags != payload.tags {
+            self.unsubscribe(&subscription.subscription_id).await?;
+            return Err(unsupported());
+        }
+        Ok(subscription)
     }
 
     async fn send_subscribe(
@@ -2991,10 +2989,14 @@ mod history_pagination_tests {
 mod tagged_subscription_tests {
     use super::*;
 
-    /// A fake server that answers every Subscribe with an active subscription,
-    /// echoing the requested tags only when `echo_tags` is set (as a server
-    /// with tag support does). Every request frame is forwarded to the test.
-    async fn fake_server(echo_tags: bool) -> (String, mpsc::UnboundedReceiver<Frame>) {
+    /// A fake server that answers every Subscribe with an active subscription.
+    /// `advertise` puts [`FEATURE_SUBSCRIPTION_TAGS`] in the register reply;
+    /// `echo_tags` echoes the requested tags, as a server that applies them
+    /// does. Every request frame is forwarded to the test.
+    async fn fake_server(
+        advertise: bool,
+        echo_tags: bool,
+    ) -> (String, mpsc::UnboundedReceiver<Frame>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (seen, received) = mpsc::unbounded_channel();
@@ -3006,6 +3008,10 @@ mod tagged_subscription_tests {
             while let Ok(Some(line)) = read_frame_line(&mut read).await {
                 let frame = Frame::from_line(&line).unwrap();
                 let reply = match frame.frame_type {
+                    FrameType::Register if advertise => serde_json::json!({
+                        "agent_id": "subscriber",
+                        "features": [FEATURE_SUBSCRIPTION_TAGS],
+                    }),
                     FrameType::Register => serde_json::json!({"agent_id": "subscriber"}),
                     FrameType::Subscribe => {
                         next_id += 1;
@@ -3052,6 +3058,16 @@ mod tagged_subscription_tests {
         frames
     }
 
+    fn frame_types(frames: &[Frame]) -> Vec<FrameType> {
+        frames.iter().map(|f| f.frame_type.clone()).collect()
+    }
+
+    async fn connect(addr: &str) -> CowchatClient {
+        CowchatClient::connect_tcp(addr, "key", "Subscriber", None, vec![])
+            .await
+            .unwrap()
+    }
+
     async fn create(client: &CowchatClient) -> Result<Subscription, ClientError> {
         client
             .create_tagged_subscription(
@@ -3068,33 +3084,25 @@ mod tagged_subscription_tests {
             .await
     }
 
-    #[tokio::test]
-    async fn a_server_without_tag_support_never_gets_a_live_tagged_subscription() {
-        let (addr, mut received) = fake_server(false).await;
-        let client = CowchatClient::connect_tcp(&addr, "key", "Subscriber", None, vec![])
-            .await
-            .unwrap();
-
-        let error = create(&client).await.expect_err("tags were not applied");
+    fn assert_unsupported(error: &ClientError) {
         assert!(
-            matches!(&error, ClientError::Protocol(m) if m.contains("tag")),
+            matches!(error, ClientError::Protocol(m)
+                if m == "server does not support tag-filtered subscriptions; upgrade the server"),
             "{error}"
         );
+    }
 
-        let frames = subscription_frames(&mut received);
-        let types: Vec<_> = frames.iter().map(|f| f.frame_type.clone()).collect();
-        assert_eq!(
-            types,
-            vec![FrameType::Subscribe, FrameType::Unsubscribe],
-            "only the probe may be created, and it must be removed"
-        );
-        let kinds = frames[0].payload["kinds"].as_array().unwrap();
-        assert_eq!(kinds.len(), 1);
+    #[tokio::test]
+    async fn a_server_that_does_not_advertise_tags_gets_no_subscribe_frame() {
+        let (addr, mut received) = fake_server(false, false).await;
+        let client = connect(&addr).await;
+
+        let error = create(&client).await.expect_err("tags are not supported");
+        assert_unsupported(&error);
         assert!(
-            kinds[0].as_str().unwrap().starts_with("cowchat-tag-probe-"),
-            "the probe must match no message, so the old server delivers nothing"
+            subscription_frames(&mut received).is_empty(),
+            "nothing may be created on a server without tag support"
         );
-        assert_eq!(frames[1].payload["subscription_id"], "sub-1");
 
         let untagged = client
             .create_subscription(
@@ -3109,34 +3117,43 @@ mod tagged_subscription_tests {
             )
             .await
             .expect("untagged subscriptions still work on older servers");
-        assert_eq!(untagged.subscription_id, "sub-2");
-        assert_eq!(subscription_frames(&mut received).len(), 1);
+        assert_eq!(untagged.subscription_id, "sub-1");
+        assert_eq!(
+            frame_types(&subscription_frames(&mut received)),
+            vec![FrameType::Subscribe]
+        );
     }
 
     #[tokio::test]
-    async fn a_server_that_applies_tags_gets_the_requested_subscription() {
-        let (addr, mut received) = fake_server(true).await;
-        let client = CowchatClient::connect_tcp(&addr, "key", "Subscriber", None, vec![])
-            .await
-            .unwrap();
+    async fn a_server_that_advertises_tags_gets_one_subscribe() {
+        let (addr, mut received) = fake_server(true, true).await;
+        let client = connect(&addr).await;
 
         let subscription = create(&client).await.unwrap();
-        assert_eq!(subscription.subscription_id, "sub-2");
+        assert_eq!(subscription.subscription_id, "sub-1");
         assert_eq!(subscription.tags, vec!["topic=ci".to_string()]);
         assert_eq!(subscription.kinds, vec!["review".to_string()]);
         assert_eq!(subscription.since_seq, 7);
 
         let frames = subscription_frames(&mut received);
-        let types: Vec<_> = frames.iter().map(|f| f.frame_type.clone()).collect();
+        assert_eq!(frame_types(&frames), vec![FrameType::Subscribe]);
+        assert_eq!(frames[0].payload["tags"], serde_json::json!(["topic=ci"]));
+        assert_eq!(frames[0].payload["kinds"], serde_json::json!(["review"]));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_advertises_tags_but_drops_them_has_the_subscription_removed() {
+        let (addr, mut received) = fake_server(true, false).await;
+        let client = connect(&addr).await;
+
+        let error = create(&client).await.expect_err("tags were not applied");
+        assert_unsupported(&error);
+
+        let frames = subscription_frames(&mut received);
         assert_eq!(
-            types,
-            vec![
-                FrameType::Subscribe,
-                FrameType::Unsubscribe,
-                FrameType::Subscribe
-            ]
+            frame_types(&frames),
+            vec![FrameType::Subscribe, FrameType::Unsubscribe]
         );
         assert_eq!(frames[1].payload["subscription_id"], "sub-1");
-        assert_eq!(frames[2].payload["tags"], serde_json::json!(["topic=ci"]));
     }
 }

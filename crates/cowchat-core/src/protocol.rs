@@ -11,6 +11,10 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// A missing version in a register frame is treated as `1` (pre-versioning).
 pub const MIN_SUPPORTED_PROTOCOL: u32 = 2;
 
+/// Register-reply feature: the server applies `SubscribePayload::tags`. A
+/// server without it ignores tags and would deliver every message.
+pub const FEATURE_SUBSCRIPTION_TAGS: &str = "subscription_tags";
+
 /// Every message on the wire is a Frame, serialized as a single line of JSON (NDJSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -205,6 +209,35 @@ pub enum FrameType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_reply_without_features_parses_as_empty() {
+        let reply: crate::RegisterReply = serde_json::from_value(serde_json::json!({
+            "agent_id": "a1",
+            "name": "Agent",
+            "protocol_version": 2,
+        }))
+        .unwrap();
+        assert_eq!(reply.agent_id, "a1");
+        assert!(reply.features.is_empty());
+    }
+
+    #[test]
+    fn register_reply_carries_advertised_features() {
+        let reply: crate::RegisterReply = serde_json::from_value(serde_json::json!({
+            "agent_id": "a1",
+            "name": "Agent",
+            "protocol_version": 2,
+            "features": [FEATURE_SUBSCRIPTION_TAGS, "some_future_feature"],
+            "session_room": {"room_id": "r", "name": "R"},
+        }))
+        .unwrap();
+        assert_eq!(
+            reply.features,
+            vec![FEATURE_SUBSCRIPTION_TAGS, "some_future_feature"]
+        );
+        assert_eq!(FEATURE_SUBSCRIPTION_TAGS, "subscription_tags");
+    }
 
     #[test]
     fn test_frame_roundtrip() {
