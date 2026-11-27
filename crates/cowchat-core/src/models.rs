@@ -108,6 +108,22 @@ pub struct RegisterPayload {
     pub protocol_version: Option<u32>,
 }
 
+/// The server's reply to a successful `Register`. The server may add more
+/// fields (such as `session_room`); readers ignore the ones they don't know.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegisterReply {
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    /// Optional behaviours this server supports, such as
+    /// [`crate::FEATURE_SUBSCRIPTION_TAGS`]. Absent on older servers.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionProof {
@@ -711,6 +727,9 @@ pub struct SubscribePayload {
     pub secret: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
+    /// Tag filters in `key` or `key=value` form. Any match delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -837,6 +856,9 @@ pub struct Subscription {
     pub webhook_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
+    /// Tag filters in `key` or `key=value` form. Any match delivers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

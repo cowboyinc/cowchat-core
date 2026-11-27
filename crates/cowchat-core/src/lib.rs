@@ -5,7 +5,10 @@ pub mod models;
 pub mod native_route;
 pub mod protocol;
 pub mod room_crypto;
+pub mod tags;
 
 pub use error::{ErrorCode, ErrorPayload};
 pub use models::*;
-pub use protocol::{Frame, FrameType, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION};
+pub use protocol::{
+    Frame, FrameType, FEATURE_SUBSCRIPTION_TAGS, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+};
